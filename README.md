@@ -22,6 +22,17 @@ The debugging agent runs your Python script, analyzes any errors that occur, and
 pip install llama-cpp-python pydantic python-magic
 ```
 
+## Model Download
+
+**CodeClutch** requires the Qwen 2.5 Coder model in GGUF format to perform autonomous debugging. 
+
+### Hugging Face CLI (Recommended)
+This is the most reliable way to download the 9GB model file.
+```bash
+pip install huggingface_hub
+hf download shehrozashoaib/Qwen_2.5_Coder_GGUF model-q4_k_m.gguf --local-dir . --local-dir-use-symlinks False
+```
+
 ## Usage
 
 ### Basic Usage
