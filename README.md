@@ -27,22 +27,45 @@ Major iterations are kept in separate folders.
 
 If you want the newest version, use `v5`.
 
+## Prerequisites
+
+Before running `v5`, make sure the machine has:
+
+- `python3`
+- `git`
+- Conda or Miniforge with a working `conda` executable
+- a local GGUF model file for the agent
+
+For CUDA builds, also make sure:
+
+- NVIDIA drivers are installed
+- `nvidia-smi` works
+- a usable CUDA toolkit is installed
+
 ## Clone And Run v5
 
-Clone the repo:
+Clone the repo and enter the latest version folder:
 
 ```bash
 git clone git@github.com:shehrozashoaib/CodeClutch.git
 cd CodeClutch/v5
 ```
 
-Set up the environments:
+Run setup before anything else:
 
 ```bash
 bash setup_agent_env.sh
 ```
 
-Point the agent at a GGUF model:
+This step is required because it generates the local helper scripts for the folder you cloned into, including:
+
+- `agent_env.sh`
+- `run_agent.sh`
+- `run_user_code.sh`
+
+Do not use the checked-in launcher scripts before setup runs. `setup_agent_env.sh` rewrites them with the correct paths for your local clone.
+
+Then point the agent at a GGUF model:
 
 ```bash
 export DEBUG_AGENT_MODEL_PATH="/path/to/your/model.gguf"
@@ -97,11 +120,21 @@ This script:
 - prepares the agent environment at `v5/.venvs/agent`
 - prepares the user runtime at `v5/.venvs/user`
 - installs agent dependencies
+- installs user requirements from `requirements-user.txt` when present
 - builds CUDA-enabled `llama.cpp` / `llama-cpp-python` when available
-- generates helper scripts:
+- regenerates helper scripts for the local checkout:
   - [`v5/agent_env.sh`](./v5/agent_env.sh)
   - [`v5/run_agent.sh`](./v5/run_agent.sh)
   - [`v5/run_user_code.sh`](./v5/run_user_code.sh)
+
+If setup succeeds, you should expect these local artifacts to exist inside `v5`:
+
+- `.venvs/agent`
+- `.venvs/user`
+- `agent_env.sh`
+- `run_agent.sh`
+- `run_user_code.sh`
+- `.setup_logs/`
 
 ## CUDA / llama.cpp
 
@@ -117,7 +150,13 @@ What we found:
 So the working build path uses an explicit architecture override:
 
 ```bash
-AGENT_ENABLE_CUDA=1 AGENT_CONFIRM_CUDA_BUILD=yes AGENT_ALLOW_CPU_FALLBACK=0 CUDA_HOME=/usr/local/cuda-12.6 CUDAToolkit_ROOT=/usr/local/cuda-12.6 LLAMA_CUDA_ARCH=90 bash setup_agent_env.sh
+AGENT_ENABLE_CUDA=1 \
+AGENT_CONFIRM_CUDA_BUILD=yes \
+AGENT_ALLOW_CPU_FALLBACK=0 \
+CUDA_HOME=/usr/local/cuda-12.6 \
+CUDAToolkit_ROOT=/usr/local/cuda-12.6 \
+LLAMA_CUDA_ARCH=90 \
+bash setup_agent_env.sh
 ```
 
 Why `LLAMA_CUDA_ARCH=90` matters here:
@@ -128,10 +167,20 @@ Why `LLAMA_CUDA_ARCH=90` matters here:
 To rerun just the CUDA builder:
 
 ```bash
-CUDA_HOME=/usr/local/cuda-12.6 CUDAToolkit_ROOT=/usr/local/cuda-12.6 LLAMA_CUDA_ARCH=90 AGENT_ALLOW_CPU_FALLBACK=0 ./build_llama_cpp_cuda.sh --env-dir .venvs/agent --yes
+CUDA_HOME=/usr/local/cuda-12.6 \
+CUDAToolkit_ROOT=/usr/local/cuda-12.6 \
+LLAMA_CUDA_ARCH=90 \
+AGENT_ALLOW_CPU_FALLBACK=0 \
+./build_llama_cpp_cuda.sh --env-dir .venvs/agent --yes
 ```
 
-Useful logs:
+Useful logs are created after setup/build under the current `v5` folder:
+
+- `./.setup_logs/llama_cpp_cuda_build.log`
+- `./.setup_logs/llama_cpp_cuda_cmake_probe.log`
+- `./.setup_logs/llama_cpp_repo_build.log`
+
+From the repository root, those same files are:
 
 - `v5/.setup_logs/llama_cpp_cuda_build.log`
 - `v5/.setup_logs/llama_cpp_cuda_cmake_probe.log`
@@ -173,7 +222,7 @@ From inside `v5`, run:
 ./run_agent.sh
 ```
 
-The launcher performs preflight checks, then starts the interactive debugger.
+The launcher starts the interactive debugger after setup has generated the correct local paths.
 
 The CLI remembers the last startup values for:
 
@@ -181,6 +230,14 @@ The CLI remembers the last startup values for:
 - initial script arguments
 
 Those values are reused as defaults on the next run.
+
+If `./run_agent.sh` fails immediately on a fresh clone, rerun:
+
+```bash
+bash setup_agent_env.sh
+```
+
+That is the correct first fix for stale launcher paths.
 
 ## Running User Code Directly
 
@@ -239,8 +296,8 @@ For those failures, the agent should:
 
 1. stop reading `site-packages` files as if they were user code
 2. inspect installed package versions in the user environment
-3. propose a targeted upgrade/downgrade/pin command
-4. rerun the script
+3. propose a targeted upgrade, downgrade, pin, or reinstall command
+4. rerun the script after the repair step
 
 This is intended to be generic behavior, not a hardcoded fix for one library.
 
@@ -268,7 +325,7 @@ The debugger is intentionally interactive.
 
 You can:
 
-- inspect stdout/stderr before the agent continues
+- inspect stdout and stderr before the agent continues
 - approve or reject proposed actions
 - provide your own guidance when rejecting a step
 - force more investigation instead of accepting a weak proposal
@@ -283,9 +340,26 @@ You can:
 5. Choose `full run`, `minimal inputs + mocking`, or `ask inside agent`.
 6. Review outputs and approve or redirect actions as needed.
 
+## Troubleshooting
+
+If setup or CUDA build fails, check:
+
+- `v5/.setup_logs/llama_cpp_cuda_build.log`
+- `v5/.setup_logs/llama_cpp_cuda_cmake_probe.log`
+- `v5/.setup_logs/llama_cpp_repo_build.log`
+
+If the launcher behaves like it still points at another machine or another path, rerun:
+
+```bash
+cd CodeClutch/v5
+bash setup_agent_env.sh
+```
+
+That regenerates the local helper scripts for the clone you are actually using.
+
 ## Notes
 
 - Files beginning with `system_` are debugger infrastructure.
 - `python-magic` is optional. The debugger falls back to simpler file-type heuristics if it is unavailable.
-- Hidden setup logs live under `v5/.setup_logs`.
+- Hidden setup logs live under `v5/.setup_logs` after setup/build runs.
 - The latest operator-facing release is `v5`.
