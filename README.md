@@ -1,153 +1,180 @@
-# Autonomous Debug Agent
+# CodeClutch
 
-## Overview
+**Debug AI-generated Python inside your real environment, with a local LLM. No token burn, no blind edits, no code leaving your machine.**
 
-This repository contains CodeClutch, a local autonomous Python debugging agent built around `llama-cpp-python`.
+<p align="center"><img src="docs/demo.gif" alt="CodeClutch demo" width="800"/></p>
 
-It is designed to behave more like a careful software engineer than a blind fixer:
+---
 
-- run the target script
-- inspect the traceback and nearby code
-- ask for approval before important actions
-- distinguish user-code bugs from environment and dependency problems
-- keep agent runtime dependencies separate from user project dependencies
-- use RAG/search as support, not as a substitute for local reasoning
+## Why CodeClutch
 
-The latest release in this repo is [`v5`](./v5).
+AI assistants write Python fast, but they don't patiently debug it. When something breaks, Copilot-style tools miss the details of your actual environment — your CUDA version, your numpy pin, your half-installed package — and burn tokens guessing at fixes from the outside.
 
-## Repository Layout
+CodeClutch runs your code where it actually lives, reads the real traceback, and proposes targeted repairs. A self-hosted LLM does the heavy reasoning on your workstation, so there's no per-token bill and nothing leaves the machine. A paid API and web RAG are available as escalation paths, not the default.
 
-Major iterations are kept in separate folders.
+## Design Principles
 
-- [`Version_1_Refactoring_and_Minimal_Inputs_Testing`](./Version_1_Refactoring_and_Minimal_Inputs_Testing)
-- [`Version_2_Stable_General_Solution`](./Version_2_Stable_General_Solution)
-- [`debugging_v3`](./debugging_v3)
-- [`debugging_v4`](./debugging_v4)
-- [`v5`](./v5)
+- **Local-first.** The reasoning model runs on your GPU via `llama.cpp`. Your code and stack traces stay on your machine.
+- **Ask before risky edits.** Writes, installs, and shell commands require your approval. The agent is interactive by design.
+- **Separate runtimes.** The agent lives in `.venvs/agent`; your project lives in `.venvs/user`. Debugger dependencies can never collide with your project's `numpy` or `torch`.
+- **Fix the right layer.** User-code failures lead to user code. Environment/dependency failures lead to the environment. Third-party library source is not edited.
+- **RAG as support, not substitute.** Web search and package-index lookups back up local reasoning — they don't replace it.
 
-If you want the newest version, use `v5`.
+## Requirements
 
-## Prerequisites
+- Linux workstation (Ubuntu tested)
+- `python3`, `git`, Conda or Miniforge
+- **GPU: 12 GB VRAM recommended** for the default model; CPU fallback works but is slow
+- For CUDA builds: NVIDIA drivers + a working `nvidia-smi` + a CUDA toolkit installed
+- One GGUF model file (see below)
 
-Before running `v5`, make sure the machine has:
+### Default model
 
-- `python3`
-- `git`
-- Conda or Miniforge with a working `conda` executable
-- a local GGUF model file for the agent
+Start with **Qwen 2.5 Coder (GGUF)** — small enough for a 12 GB card, strong on Python:
 
-For CUDA builds, also make sure:
+- <https://huggingface.co/shehrozashoaib/Qwen_2.5_Coder_GGUF>
 
-- NVIDIA drivers are installed
-- `nvidia-smi` works
-- a usable CUDA toolkit is installed
+For larger workstations, IQuest V1 40B (4 K M quant) gives better reasoning at the cost of VRAM:
 
-## Clone And Run v5
+- <https://huggingface.co/shehrozashoaib/IQuest_V1_40B_GGUF_4KM>
 
-Clone the repo and enter the latest version folder:
+## Quickstart
 
 ```bash
 git clone git@github.com:shehrozashoaib/CodeClutch.git
 cd CodeClutch/v5
-```
-
-Run setup before anything else:
-
-```bash
 bash setup_agent_env.sh
-```
-
-This step is required because it generates the local helper scripts for the folder you cloned into, including:
-
-- `agent_env.sh`
-- `run_agent.sh`
-- `run_user_code.sh`
-
-Do not use the checked-in launcher scripts before setup runs. `setup_agent_env.sh` rewrites them with the correct paths for your local clone.
-
-Then point the agent at a GGUF model:
-
-```bash
 export DEBUG_AGENT_MODEL_PATH="/path/to/your/model.gguf"
-```
-
-Start the agent:
-
-```bash
 ./run_agent.sh
 ```
 
-## What We Are Building
+`setup_agent_env.sh` must run before `run_agent.sh` — it builds the two runtimes and regenerates the launcher scripts with paths that match your local clone. The launchers checked into git are templates; do not run them directly.
 
-The goal is not just a script runner. The goal is a reusable autonomous debugger that can:
-
-- debug arbitrary Python projects
-- reason about code changes versus environment fixes
-- avoid blind edits to third-party libraries
-- install or repair dependencies in the correct runtime
-- support CUDA-backed local LLM inference through `llama.cpp`
-
-The system files in `v5` are the debugger infrastructure:
-
-- [`v5/system_debug_cli.py`](./v5/system_debug_cli.py): terminal launcher and startup flow
-- [`v5/system_llm_agent.py`](./v5/system_llm_agent.py): main debugging loop and reasoning logic
-- [`v5/system_tools.py`](./v5/system_tools.py): script execution, terminal commands, file reads/writes, output capture
-
-## Runtime Model
-
-There are two separate runtimes.
-
-- Agent runtime: `v5/.venvs/agent`
-  - runs the debugger itself
-  - contains `llama-cpp-python` and the agent-side dependencies
-- User runtime: `v5/.venvs/user`
-  - runs the user's project code
-  - is the environment the agent installs project dependencies into
-  - stays separate from the agent runtime
-
-This separation is important. User project installs should not pollute the agent runtime, and agent-side model/runtime dependencies should not control the user project.
-
-## Setup
-
-From inside `v5`, run:
+Persist the model path across shells:
 
 ```bash
-bash setup_agent_env.sh
+echo 'export DEBUG_AGENT_MODEL_PATH="/path/to/your/model.gguf"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-This script:
+## How It Works
 
-- prepares the agent environment at `v5/.venvs/agent`
-- prepares the user runtime at `v5/.venvs/user`
-- installs agent dependencies
-- installs user requirements from `requirements-user.txt` when present
-- builds CUDA-enabled `llama.cpp` / `llama-cpp-python` when available
-- regenerates helper scripts for the local checkout:
-  - [`v5/agent_env.sh`](./v5/agent_env.sh)
-  - [`v5/run_agent.sh`](./v5/run_agent.sh)
-  - [`v5/run_user_code.sh`](./v5/run_user_code.sh)
+```
+    ┌──────────┐      ┌────────────┐      ┌──────────────┐      ┌──────────┐
+    │  Your    │  →   │ CodeClutch │  →   │ Review &     │  →   │ Fix      │
+    │  script  │      │ runs it    │      │ approve      │      │ applied  │
+    └──────────┘      └─────┬──────┘      └──────┬───────┘      └──────────┘
+                            │                    │
+                            ▼                    ▼
+                      ┌────────────┐      ┌──────────────┐
+                      │ Traceback  │      │ Escalate to  │
+                      │ + env info │      │ paid LLM/RAG │
+                      └────────────┘      │ if stuck     │
+                                          └──────────────┘
+```
 
-If setup succeeds, you should expect these local artifacts to exist inside `v5`:
+1. **Run** — the agent executes your script in the user runtime and captures stdout, stderr, and exit code.
+2. **Inspect** — on failure, it reads the traceback, looks at nearby code, and checks installed package versions.
+3. **Diagnose** — it classifies the failure as a user-code bug or an environment/dependency problem.
+4. **Ask** — it proposes an action (edit, install, rerun, shell command) and waits for your approval.
+5. **Escalate** — if local reasoning is stuck, it can call out to RAG or a paid LLM, with your consent.
 
-- `.venvs/agent`
-- `.venvs/user`
-- `agent_env.sh`
-- `run_agent.sh`
-- `run_user_code.sh`
-- `.setup_logs/`
+## Worked Example
 
-## CUDA / llama.cpp
+A real case from converting an LFM2 checkpoint to GGUF. The user code references a hyperparameter key that doesn't exist in the model config:
 
-This workstation needed a specific workaround.
+```python
+class LFM2Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.LFM2
 
-What we found:
+    def _add_feed_forward_length(self):
+        ff_dim = self.find_hparam(["block_ff_dim", "intermediate_size"])
+        auto_adjust_ff_dim = self.hparams["block_auto_adjust_ff_dim"]
+        ffn_dim_multiplier = self.hparams["block_ffn_dim_multiplier"]
+        multiple_of = self.hparams["ffn_multiple_of"]   # wrong key
+```
 
-- complete usable toolkit: `/usr/local/cuda-12.6`
-- `/usr/local/cuda-13.1` existed but was incomplete for builds
-- native GPU architecture detection selected `compute_120a`
-- CUDA 12.6 `nvcc` could not compile that architecture
+A session looks like:
 
-So the working build path uses an explicit architecture override:
+```
+$ ./run_agent.sh
+[target] convert_hf_to_gguf.py  (args: /models/lfm2-ckpt --outtype f16)
+
+--- run 1 ---
+KeyError: 'ffn_multiple_of'
+  at convert_hf_to_gguf.py:<LINE>, in LFM2Model._add_feed_forward_length
+
+[agent] This is a user-code bug, not an environment problem.
+[agent] Inspecting self.hparams keys from the loaded checkpoint...
+[agent] Keys present: block_ff_dim, block_auto_adjust_ff_dim,
+        block_ffn_dim_multiplier, block_multiple_of, ...
+[agent] Siblings follow the `block_*` naming convention. `ffn_multiple_of`
+        looks like a typo; the actual key in this config is `block_multiple_of`.
+[agent] Propose: edit LFM2Model._add_feed_forward_length to read
+        `self.hparams["block_multiple_of"]`.
+Approve edit? [y/n/guide] y
+
+--- run 2 ---
+[OK] wrote lfm2-ckpt.f16.gguf  (exit 0)
+[agent] Done.
+```
+
+Notice what the agent did **not** do:
+
+- it didn't `pip install` a mystery package to paper over a `KeyError`
+- it didn't edit `gguf`, `transformers`, or any third-party library
+- it read the actual `hparams` dict from the running process to confirm the real key before proposing a fix
+- no paid tokens were consumed — the entire loop ran on the local GGUF model
+
+## Status
+
+Private beta with ~8 ML teams. **DM [@shehrozashoaib](https://github.com/shehrozashoaib) to try it.**
+
+## Repository Layout
+
+The latest operator-facing release is **`v5`**. Earlier iterations are kept for reference:
+
+- [`v5`](./v5) — current
+- [`debugging_v4`](./debugging_v4), [`debugging_v3`](./debugging_v3) — previous iterations
+- [`Version_2_Stable_General_Solution`](./Version_2_Stable_General_Solution), [`Version_1_Refactoring_and_Minimal_Inputs_Testing`](./Version_1_Refactoring_and_Minimal_Inputs_Testing) — early prototypes
+
+Core v5 files:
+
+- [`v5/system_debug_cli.py`](./v5/system_debug_cli.py) — terminal launcher and startup flow
+- [`v5/system_llm_agent.py`](./v5/system_llm_agent.py) — main debugging loop and reasoning
+- [`v5/system_tools.py`](./v5/system_tools.py) — script execution, shell, file I/O, output capture
+
+## Advanced Setup
+
+### Runtimes
+
+`setup_agent_env.sh` creates two isolated environments inside `v5/`:
+
+| Path | Purpose |
+| --- | --- |
+| `.venvs/agent` | Debugger runtime — `llama-cpp-python`, agent-side deps |
+| `.venvs/user`  | Your project's runtime — agent installs project deps here |
+
+Load helpers into your shell if you want to poke around manually:
+
+```bash
+source ./agent_env.sh
+activate_agent_env   # or activate_user_env
+```
+
+Run user code directly (without the agent):
+
+```bash
+./run_user_code.sh your_script.py [args ...]
+```
+
+### CUDA builds
+
+CodeClutch builds `llama-cpp-python` against `llama.cpp` with CUDA support when it's available. Some workstations need an explicit GPU architecture override.
+
+**Symptom.** `setup_agent_env.sh` fails in the CUDA build step with an error like `nvcc does not support compute_120a` (or similar), typically because auto-detection picked a target your installed `nvcc` can't compile.
+
+**Fix.** Pin the CUDA toolkit and architecture explicitly:
 
 ```bash
 AGENT_ENABLE_CUDA=1 \
@@ -159,12 +186,9 @@ LLAMA_CUDA_ARCH=90 \
 bash setup_agent_env.sh
 ```
 
-Why `LLAMA_CUDA_ARCH=90` matters here:
+Adjust `CUDA_HOME` to point at your complete toolkit (check `ls /usr/local/cuda-*`). `LLAMA_CUDA_ARCH=90` is the stable workaround for avoiding bad native autodetect.
 
-- it avoids the unsupported native autodetect path on this machine
-- it is the current stable workaround for building the CUDA version successfully
-
-To rerun just the CUDA builder:
+To rerun only the CUDA builder:
 
 ```bash
 CUDA_HOME=/usr/local/cuda-12.6 \
@@ -174,192 +198,47 @@ AGENT_ALLOW_CPU_FALLBACK=0 \
 ./build_llama_cpp_cuda.sh --env-dir .venvs/agent --yes
 ```
 
-Useful logs are created after setup/build under the current `v5` folder:
+Build logs land under `v5/.setup_logs/`:
 
-- `./.setup_logs/llama_cpp_cuda_build.log`
-- `./.setup_logs/llama_cpp_cuda_cmake_probe.log`
-- `./.setup_logs/llama_cpp_repo_build.log`
-
-From the repository root, those same files are:
-
-- `v5/.setup_logs/llama_cpp_cuda_build.log`
-- `v5/.setup_logs/llama_cpp_cuda_cmake_probe.log`
-- `v5/.setup_logs/llama_cpp_repo_build.log`
-
-## Model Path
-
-The agent reads the model path from `DEBUG_AGENT_MODEL_PATH`.
-
-To set it permanently in your shell:
-
-```bash
-echo 'export DEBUG_AGENT_MODEL_PATH="/path/to/your/model.gguf"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-Verify:
-
-```bash
-echo "$DEBUG_AGENT_MODEL_PATH"
-```
-
-Using the environment variable is preferred over editing [`v5/run_agent.sh`](./v5/run_agent.sh), because setup can regenerate the launcher script.
-
-## GGUF Model Sources
-
-If you need GGUF model files for local `llama.cpp` / `llama-cpp-python` runs, these Hugging Face repos are the current workspace references:
-
-- Qwen 2.5 Coder GGUF: <https://huggingface.co/shehrozashoaib/Qwen_2.5_Coder_GGUF>
-- IQuest V1 40B GGUF 4KM: <https://huggingface.co/shehrozashoaib/IQuest_V1_40B_GGUF_4KM>
-
-These are model download sources only. After downloading a `.gguf` file, point `DEBUG_AGENT_MODEL_PATH` at the file you want the agent to use.
-
-## Starting The Agent
-
-From inside `v5`, run:
-
-```bash
-./run_agent.sh
-```
-
-The launcher starts the interactive debugger after setup has generated the correct local paths.
-
-The CLI remembers the last startup values for:
-
-- target file
-- initial script arguments
-
-Those values are reused as defaults on the next run.
-
-If `./run_agent.sh` fails immediately on a fresh clone, rerun:
-
-```bash
-bash setup_agent_env.sh
-```
-
-That is the correct first fix for stale launcher paths.
-
-## Running User Code Directly
-
-To run project code in the user runtime directly:
-
-```bash
-./run_user_code.sh your_script.py [args ...]
-```
-
-## Helper Activations
-
-You can load helper functions with:
-
-```bash
-source ./agent_env.sh
-```
-
-Then use:
-
-```bash
-activate_agent_env
-activate_user_env
-```
-
-## How The Debugger Behaves
-
-The agent is designed to imitate an actual engineer rather than blindly editing code.
-
-Current behavior:
-
-- it runs the target script and records stdout/stderr/exit code
-- it offers output review menus so you can inspect failures before continuing
-- it offers approval prompts before major actions such as terminal commands or writes
-- it keeps a history of repeated failures and tries to detect cyclic behavior
-- it uses RAG/search as supporting evidence, not as a direct replacement for local inspection
-- it supports a minimal-input plus mocking workflow for expensive pipelines
-- it releases the GPU-loaded model before user runs and restores it afterward
-
-The important design rule is:
-
-- user-code failures should lead to reading and editing user code
-- environment/dependency failures should lead to inspecting and repairing the environment
-- third-party library source should generally not be edited
-
-## Environment And Dependency Handling
-
-The debugger treats repeated third-party import/API failures as environment problems.
-
-Examples of this class:
-
-- `ModuleNotFoundError` inside `site-packages`
-- `ImportError: cannot import name ...` coming from third-party packages
-- package API/version drift across installed libraries
-
-For those failures, the agent should:
-
-1. stop reading `site-packages` files as if they were user code
-2. inspect installed package versions in the user environment
-3. propose a targeted upgrade, downgrade, pin, or reinstall command
-4. rerun the script after the repair step
-
-This is intended to be generic behavior, not a hardcoded fix for one library.
-
-## RAG Behavior
-
-The RAG pipeline is meant to support debugging, not dominate it.
-
-For import-related and compatibility-related failures, it can use:
-
-- the import line and import path when available
-- package-index style search queries
-- package candidate extraction from search results
-- runtime context for CUDA-sensitive dependencies like `torch`
-- local environment facts collected during the run
-
-The desired behavior is:
-
-- avoid defaulting to `pip install <import-name>` when that is likely wrong
-- prefer evidence-backed package candidates
-- for runtime-sensitive libraries, choose a build that matches the local machine context
-
-## Human-In-The-Loop Controls
-
-The debugger is intentionally interactive.
-
-You can:
-
-- inspect stdout and stderr before the agent continues
-- approve or reject proposed actions
-- provide your own guidance when rejecting a step
-- force more investigation instead of accepting a weak proposal
-- allow a one-shot library patch only when you explicitly want that local hotfix
-
-## Typical v5 Workflow
-
-1. Clone the repo and `cd CodeClutch/v5`.
-2. Run `bash setup_agent_env.sh`.
-3. Export `DEBUG_AGENT_MODEL_PATH`.
-4. Start the agent with `./run_agent.sh`.
-5. Choose `full run`, `minimal inputs + mocking`, or `ask inside agent`.
-6. Review outputs and approve or redirect actions as needed.
+- `llama_cpp_cuda_build.log`
+- `llama_cpp_cuda_cmake_probe.log`
+- `llama_cpp_repo_build.log`
 
 ## Troubleshooting
 
-If setup or CUDA build fails, check:
+**`./run_agent.sh` fails on a fresh clone.** The launcher scripts committed to git are templates. Run `bash setup_agent_env.sh` first — it rewrites them with the correct paths for your machine.
 
-- `v5/.setup_logs/llama_cpp_cuda_build.log`
-- `v5/.setup_logs/llama_cpp_cuda_cmake_probe.log`
-- `v5/.setup_logs/llama_cpp_repo_build.log`
+**Launcher behaves like it points at a different path.** Same fix: rerun `bash setup_agent_env.sh`.
 
-If the launcher behaves like it still points at another machine or another path, rerun:
+**CUDA build errors.** See *Advanced Setup → CUDA builds* and check the three `.setup_logs/` files listed there.
 
-```bash
-cd CodeClutch/v5
-bash setup_agent_env.sh
-```
+**Model not loading.** Confirm `echo "$DEBUG_AGENT_MODEL_PATH"` points at an existing `.gguf` file and the file isn't an LFS pointer.
 
-That regenerates the local helper scripts for the clone you are actually using.
+**`python-magic` warnings.** Optional. The agent falls back to simpler file-type heuristics.
 
-## Notes
+## Human-in-the-Loop Controls
 
-- Files beginning with `system_` are debugger infrastructure.
-- `python-magic` is optional. The debugger falls back to simpler file-type heuristics if it is unavailable.
-- Hidden setup logs live under `v5/.setup_logs` after setup/build runs.
-- The latest operator-facing release is `v5`.
+While the agent is running you can:
+
+- inspect stdout/stderr before it continues
+- approve, reject, or redirect each proposed action
+- force further investigation instead of accepting a weak proposal
+- allow a one-shot library patch if you explicitly want a local hotfix
+
+The CLI remembers the last target file and script arguments as defaults for the next run.
+
+## Roadmap
+
+- Broader language support beyond Python
+- IDE integration (VS Code extension)
+- Richer repo-wide context (code graph)
+- Optional cloud model fallback with strict data controls
+
+## Contact
+
+- GitHub: [@shehrozashoaib](https://github.com/shehrozashoaib)
+- Issues / beta requests: open a GitHub issue on this repo
+
+## License
+
+TBD — a permissive license (MIT or Apache-2.0) will be added before public launch.
