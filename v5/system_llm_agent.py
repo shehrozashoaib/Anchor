@@ -427,6 +427,919 @@ def _infer_loaded_artifact_from_user_frame(state: Dict[str, Any], user_frame: Di
     return None
 
 
+def _infer_keyerror_investigation_target(file_path: str, error_line: int) -> Dict[str, Any] | None:
+    """
+    Redirect repeated KeyError guessing toward where the same object/dict is populated,
+    or at least to the owning function/class context instead of the failing line again.
+    """
+    if not file_path or error_line <= 0 or not os.path.exists(file_path):
+        return None
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    if error_line > len(lines):
+        return None
+
+    error_code = lines[error_line - 1]
+    dict_match = re.search(r"((?:\w+\.)?\w+)\[[\'\"](.*?)[\'\"]\]", error_code)
+    target_expr = dict_match.group(1) if dict_match else ""
+
+    if target_expr:
+        escaped_target = re.escape(target_expr)
+        population_patterns = [
+            rf"{escaped_target}\s*=\s*",
+            rf"{escaped_target}\.update\s*\(",
+            rf"{escaped_target}\.setdefault\s*\(",
+            rf"{escaped_target}\[[\'\"][^\'\"]+[\'\"]\]\s*=",
+        ]
+        for idx in range(error_line - 2, -1, -1):
+            stripped = lines[idx].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if any(re.search(pattern, lines[idx]) for pattern in population_patterns):
+                return {
+                    "file": file_path,
+                    "line": idx + 1,
+                    "reason": f"{target_expr} is populated here",
+                }
+
+    func_line = None
+    class_line = None
+    for idx in range(error_line - 1, -1, -1):
+        stripped = lines[idx].lstrip()
+        if func_line is None and stripped.startswith("def "):
+            func_line = idx + 1
+            break
+        if class_line is None and stripped.startswith("class "):
+            class_line = idx + 1
+
+    if func_line:
+        return {"file": file_path, "line": func_line, "reason": "start of the owning function"}
+    if class_line:
+        return {"file": file_path, "line": class_line, "reason": "start of the owning class"}
+    return {"file": file_path, "line": max(1, error_line - 20), "reason": "wider local context above the failing access"}
+
+
+# =============================================================================
+# TIER LADDER — escalation machinery for repeated near-miss failures
+#
+# Generalises "the agent keeps proposing variants of the same bad fix" into a
+# signature-keyed ladder.  A signature is (error_type, file, line).  When the
+# same signature accumulates repeated write-blocks, the ladder climbs:
+#
+#     Tier 0  free              normal operation, validators advise
+#     Tier 1  pinned read       next action is forced to a specific read
+#     Tier 2  candidate table   writes at frozen location rejected; structured
+#                               candidates with evidence injected; recent chat
+#                               history truncated so the LLM is not re-reading
+#                               its own rejected drafts
+#     Tier 3  user escalation   pause for user answer (interactive) or emit a
+#                               structured stuck-packet and exit (unattended)
+#     Tier 4  hard stop         exit run cleanly with status=escalated
+#
+# Three primitives support this:
+#   - state["forced_next_action"]        constraint on the action space
+#   - state["frozen_locations"]          file:line where writes are refused
+#   - state["signature_block_counts"]    persistent count per signature
+# =============================================================================
+
+
+def _error_signature(state: Dict[str, Any], fallback_file: str = "", fallback_line: int = 0) -> str:
+    """Build a stable signature for the current failure: (type, file, line).
+
+    Falls back to file/line from state or caller-provided values so the ladder
+    still progresses even when full_error_history is partially populated.  A
+    non-empty signature is required for tier transitions to fire, so this
+    function must never silently return "" when there's clearly a failure in
+    flight.
+    """
+    history = state.get("full_error_history") or []
+    last = history[-1] if history else {}
+    last = last or {}
+
+    err_type = str(last.get("error_type") or "").strip()
+    err_file = str(last.get("file") or state.get("last_error_file") or fallback_file or "").strip()
+    err_file = os.path.normpath(err_file) if err_file else ""
+    err_line = last.get("line") or state.get("error_line") or fallback_line or 0
+    try:
+        err_line = int(err_line)
+    except Exception:
+        err_line = 0
+
+    # Fallback: if we have a file but no type, key on file:line so repeat
+    # blocks at the same spot still escalate.
+    if not err_type:
+        err_type = "UnknownError"
+    if not err_file and not err_line:
+        # Last-resort anchor so the ladder can still increment.
+        err_file = state.get("target_file", "") or "unknown"
+    return f"{err_type}|{err_file}|{err_line}"
+
+
+def _current_tier(state: Dict[str, Any], signature: str = "") -> int:
+    if not signature:
+        signature = _error_signature(state)
+    if not signature:
+        return 0
+    return int((state.get("signature_tiers") or {}).get(signature, 0))
+
+
+def _set_tier(state: Dict[str, Any], signature: str, tier: int) -> None:
+    if not signature:
+        return
+    state.setdefault("signature_tiers", {})[signature] = tier
+
+
+def _increment_signature_block(state: Dict[str, Any], signature: str) -> int:
+    counts = state.setdefault("signature_block_counts", {})
+    counts[signature] = int(counts.get(signature, 0)) + 1
+    return counts[signature]
+
+
+def _freeze_location(state: Dict[str, Any], file_path: str, start_line: int, end_line: int) -> None:
+    """Mark a write range as mechanically forbidden for the remainder of this
+    error signature.  The writer rejects at the location gate, before preview,
+    so bad proposals never reach the user's screen again."""
+    frozen = state.setdefault("frozen_locations", [])
+    abs_path = os.path.abspath(file_path or "")
+    start = max(1, int(start_line or 1))
+    end = max(start, int(end_line or start))
+    for entry in frozen:
+        if entry.get("file") == abs_path and entry.get("start") == start and entry.get("end") == end:
+            return
+    frozen.append({"file": abs_path, "start": start, "end": end})
+
+
+def _is_location_frozen(state: Dict[str, Any], file_path: str, start_line: int, end_line: int) -> bool:
+    abs_path = os.path.abspath(file_path or "")
+    start = max(1, int(start_line or 1))
+    end = max(start, int(end_line or start))
+    for entry in state.get("frozen_locations") or []:
+        if entry.get("file") != abs_path:
+            continue
+        # Any overlap counts as frozen.
+        if not (end < int(entry.get("start", 0)) or start > int(entry.get("end", 0))):
+            return True
+    return False
+
+
+def _set_forced_read(state: Dict[str, Any], file_path: str, line: int, reason: str, reads: int = 2) -> None:
+    """Queue a forced read that supersedes whatever the LLM next proposes.
+
+    `reads` is the number of reads for which the pin stays sticky — a single
+    read is often not enough to survive escalation of the read range or a
+    second block cycle.  The pin is cleared when `pin_reads_remaining` hits 0
+    or when a write successfully lands.
+    """
+    state["forced_next_action"] = {
+        "kind": "ReadFileInput",
+        "file_path": file_path,
+        "error_line": int(line or 1),
+        "reason": reason or "forced read target",
+    }
+    state["artifact_read_target"] = {
+        "file": file_path,
+        "line": int(line or 1),
+        "reason": reason or "forced read target",
+    }
+    state["pin_reads_remaining"] = max(1, int(reads))
+
+
+def _clear_forced_action(state: Dict[str, Any]) -> None:
+    state["forced_next_action"] = None
+    state["artifact_read_target"] = {}
+    state["pin_reads_remaining"] = 0
+
+
+def _truncate_chat_history_on_tier_transition(
+    chat_history: List[Dict[str, str]],
+    summary: str,
+    keep_first: int = 1,
+    keep_last: int = 2,
+) -> None:
+    """Collapse middle turns into one summary turn so the LLM stops re-reading
+    its own rejected drafts.  Mutates chat_history in place.  Always keeps the
+    initial goal message and the most recent context."""
+    if len(chat_history) <= keep_first + keep_last + 1:
+        return
+    head = chat_history[:keep_first]
+    tail = chat_history[-keep_last:] if keep_last > 0 else []
+    summary_turn = {"role": "user", "content": f"[CONTEXT COLLAPSED BY ESCALATION]\n{summary}"}
+    chat_history[:] = head + [summary_turn] + tail
+
+
+def _resolve_upstream_config_keys(
+    state: Dict[str, Any],
+    error_file: str,
+    owner_name: str = "",
+) -> tuple:
+    """Try to find the upstream source of `self.hparams` / config-style dicts
+    and return its actual top-level keys.
+
+    Why: ground-truth keys live in the JSON/YAML that feeds the dict at
+    runtime.  Guessing from nearby code accesses can't catch the common case
+    where the ONLY valid key names are prefixed (e.g. `block_*`) and the code
+    is asking for a different prefix (e.g. `ffn_*`).
+
+    Returns (keys_set, source_label).  Empty set + "" when nothing found.
+
+    Strategy (general, not hardcoded to convert_hf_to_gguf):
+      1. Walk the run_args for positional directory/file paths and recognised
+         flags (`--config`, `--model`, `--model_path`, `--model_dir`, etc).
+      2. For each candidate, probe for common config filenames
+         (`config.json`, `generation_config.json`, `*.json`, `*.yaml`).
+      3. Load the first one that parses and collect its top-level keys.
+
+    The caller combines these keys with structural nearby-access evidence so
+    the candidate ranker prefers names that actually exist upstream.
+    """
+    keys: set = set()
+    source = ""
+    if not state:
+        return keys, source
+
+    run_args = state.get("run_args") or []
+    cli_flag_map = _parse_flag_arguments(run_args)
+
+    # Candidate path set: positional non-flag args + common config flags.
+    flag_names = [
+        "config", "config_file", "config_path",
+        "model", "model_path", "model_dir", "model_name_or_path",
+        "checkpoint", "ckpt", "weights_dir", "pretrained",
+        "input", "input_dir", "input_path",
+    ]
+    path_candidates: List[str] = []
+    for flag in flag_names:
+        if flag in cli_flag_map and cli_flag_map[flag] and cli_flag_map[flag] != "true":
+            path_candidates.append(cli_flag_map[flag])
+    # Positional (non-flag) run_args
+    i = 0
+    args_list = list(run_args or [])
+    while i < len(args_list):
+        item = str(args_list[i])
+        if item.startswith("--"):
+            # Skip the flag and its value
+            if i + 1 < len(args_list) and not str(args_list[i + 1]).startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        path_candidates.append(item)
+        i += 1
+
+    if state.get("target_file"):
+        path_candidates.append(os.path.dirname(os.path.abspath(state["target_file"])))
+
+    # Resolve directories vs files
+    resolved: List[str] = []
+    for raw in path_candidates:
+        if not raw:
+            continue
+        r = os.path.abspath(os.path.expanduser(str(raw).strip().strip("\"'")))
+        if os.path.isdir(r):
+            resolved.append(r)
+        elif os.path.isfile(r):
+            resolved.append(r)
+
+    probe_names = [
+        "config.json",
+        "params.json",
+        "hparams.json",
+        "model_config.json",
+        "generation_config.json",
+    ]
+
+    def _extract_top_keys(path: str) -> set:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return set()
+        if isinstance(data, dict):
+            return set(str(k) for k in data.keys())
+        return set()
+
+    for path in resolved:
+        if os.path.isfile(path) and path.lower().endswith(".json"):
+            k = _extract_top_keys(path)
+            if k:
+                keys |= k
+                source = path
+                break
+            continue
+        if os.path.isdir(path):
+            for name in probe_names:
+                candidate = os.path.join(path, name)
+                if os.path.isfile(candidate):
+                    k = _extract_top_keys(candidate)
+                    if k:
+                        keys |= k
+                        source = candidate
+                        break
+            if keys:
+                break
+
+    return keys, source
+
+
+def _build_keyerror_candidate_table(
+    missing_key: str,
+    file_path: str,
+    error_line: int,
+    max_candidates: int = 8,
+    state: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """Enumerate plausible replacement keys with evidence.
+
+    For each candidate we score:
+      - occurrence count in the nearby code window
+      - substring / semantic overlap with `missing_key`
+      - whether it appears in a population site for the same object
+
+    The agent is constrained to pick from this list (or request another read)
+    in Tier 2 — no free-form `.get()` generation.  Returns a list of dicts
+    ordered by confidence.  Empty list if nothing can be inferred.
+    """
+    if not file_path or not os.path.exists(file_path) or error_line <= 0:
+        return []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    if error_line > len(lines):
+        return []
+
+    error_code = lines[error_line - 1]
+    dict_match = re.search(r"((?:\w+\.)?\w+)\[[\'\"](.*?)[\'\"]\]", error_code)
+    owner = dict_match.group(1) if dict_match else ""
+
+    # Extract the LHS assignee on the failing line — e.g. `ff_dim` in
+    # `ff_dim = self.hparams['block_ff_dim']`.  This is the semantic handle
+    # for downstream-usage analysis.
+    lhs_match = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", error_code)
+    lhs_name = lhs_match.group(1) if lhs_match else ""
+
+    window_start = max(0, error_line - 200)
+    window_end = min(len(lines), error_line + 200)
+    window = "".join(lines[window_start:window_end])
+
+    # ---------------------------------------------------------------
+    # BEHAVIOURAL SIGNAL: downstream usage of the LHS assignee
+    #
+    # If the failing line assigns to `ff_dim`, find every subsequent use of
+    # `ff_dim` in the surrounding scope and record the function call /
+    # attribute context.  Example: a call like
+    #   self.gguf_writer.add_feed_forward_length(ff_dim)
+    # gives us the "role" token `add_feed_forward_length`, which matches
+    # candidate keys like `intermediate_size` far better than random nearby
+    # accesses.
+    #
+    # We use two signals:
+    #   - role_tokens: the function/method name the LHS is passed to
+    #   - literal_roles: string constants right next to the LHS (e.g.
+    #     `writer.add_uint32("ff_dim", ff_dim)` → "ff_dim" as literal)
+    # ---------------------------------------------------------------
+    role_tokens: List[str] = []
+    literal_roles: List[str] = []
+    if lhs_name:
+        lhs_pat = re.compile(rf"\b{re.escape(lhs_name)}\b")
+        # Look at lines AFTER the failing line, still inside the same function.
+        for idx in range(error_line, window_end):
+            ln = lines[idx]
+            if not lhs_pat.search(ln):
+                continue
+            # `foo(bar_arg=lhs)` → role is foo + kwarg
+            for m in re.finditer(r"(\w+)\s*\(", ln):
+                role_tokens.append(m.group(1))
+            # `.add_X(lhs)` / `.set_X(lhs)` → role is X
+            for m in re.finditer(r"\.(\w+)\s*\(", ln):
+                role_tokens.append(m.group(1))
+            # String literals adjacent to lhs usage
+            for m in re.finditer(r"[\"\']([\w\-\. /]+)[\"\']", ln):
+                literal_roles.append(m.group(1))
+            # Stop if we hit the next top-level def/class (out of scope)
+            stripped = ln.lstrip()
+            if stripped.startswith("def ") or stripped.startswith("class "):
+                break
+
+    role_tokens_lc = [t.lower() for t in role_tokens]
+    literal_roles_lc = [t.lower() for t in literal_roles]
+
+    def _role_match_score(candidate: str) -> tuple:
+        """Return (score, evidence_fragment) for how well `candidate`'s name
+        matches the downstream role tokens of the LHS assignee."""
+        if not role_tokens_lc and not literal_roles_lc:
+            return 0.0, ""
+        cand_tokens = set(t for t in re.split(r"[_\W]+", candidate.lower()) if t)
+        best = 0.0
+        evidence = ""
+        for role in role_tokens_lc:
+            role_tokens_set = set(t for t in re.split(r"[_\W]+", role) if t)
+            if not role_tokens_set:
+                continue
+            overlap = len(cand_tokens & role_tokens_set) / max(len(cand_tokens | role_tokens_set), 1)
+            if overlap > best:
+                best = overlap
+                evidence = f"matches downstream role '{role}'"
+        for lit in literal_roles_lc:
+            if lit == candidate.lower():
+                return 1.0, f"literal '{lit}' used next to LHS downstream"
+        return best, evidence
+
+    if owner:
+        escaped = re.escape(owner)
+        # Match keys accessed on the same owner by [] or .get()
+        pattern_bracket = rf"{escaped}\[[\'\"](\w+)[\'\"]\]"
+        pattern_get = rf"{escaped}\.get\s*\(\s*[\'\"](\w+)[\'\"]"
+        found = re.findall(pattern_bracket, window) + re.findall(pattern_get, window)
+    else:
+        pattern_any = r"\[[\'\"](\w+)[\'\"]\]"
+        found = re.findall(pattern_any, window)
+
+    counts: Dict[str, int] = {}
+    for key in found:
+        if key == missing_key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+
+    def overlap_score(a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        a_low = a.lower().replace("_", "")
+        b_low = b.lower().replace("_", "")
+        if a_low == b_low:
+            return 1.0
+        if a_low in b_low or b_low in a_low:
+            return 0.7
+        # token overlap
+        at = set(re.split(r"[_\W]+", a.lower()))
+        bt = set(re.split(r"[_\W]+", b.lower()))
+        at.discard("")
+        bt.discard("")
+        if not at or not bt:
+            return 0.0
+        return len(at & bt) / max(len(at | bt), 1)
+
+    # --------------------------------------------------------------
+    # UPSTREAM GROUND TRUTH
+    #
+    # The most reliable candidate source is the actual config file that
+    # populates the dict at runtime.  If we can resolve it we trust those
+    # keys over nearby structural accesses — the nearby accesses only tell
+    # us what the CODE asks for, which is exactly what's wrong when the code
+    # uses a stale prefix (e.g. `ffn_*` vs config's `block_*`).
+    # --------------------------------------------------------------
+    upstream_keys: set = set()
+    upstream_source = ""
+    if state is not None:
+        upstream_keys, upstream_source = _resolve_upstream_config_keys(state, file_path, owner)
+        # Persist so validate_write_safety can treat upstream-config keys as
+        # justified evidence for a replacement, even if the LLM's most recent
+        # read window doesn't include them verbatim.
+        if upstream_keys:
+            state["upstream_config_keys"] = set(upstream_keys)
+            if upstream_source:
+                state["upstream_config_source"] = upstream_source
+
+    # Merge: every key we'll consider, plus the missing-key excluded.
+    all_keys = set(counts.keys()) | {k for k in upstream_keys if k != missing_key}
+
+    candidates = []
+    for key in all_keys:
+        occurrences = counts.get(key, 0)
+        score = overlap_score(missing_key, key)
+        pop_hit = any(
+            re.search(rf"\b{re.escape(key)}\b", lines[idx])
+            and re.search(r"=\s*", lines[idx])
+            for idx in range(window_start, window_end)
+            if idx < len(lines)
+        )
+        role_score, role_evidence = _role_match_score(key)
+        in_upstream = key in upstream_keys
+
+        # Upstream presence is a *gate*, not a flat bonus: a key that isn't in
+        # the upstream config is almost certainly not the right answer when
+        # upstream resolution succeeded.  Within the gated set, semantic
+        # overlap with the missing key dominates.
+        upstream_gate_bonus = 0.10 if in_upstream else 0.0
+        upstream_exclude_penalty = 0.0
+        if upstream_keys and not in_upstream:
+            upstream_exclude_penalty = -0.40  # strongly push out-of-schema keys down
+
+        confidence = (
+            0.55 * score
+            + 0.02 * min(occurrences, 5)
+            + (0.05 if pop_hit else 0.0)
+            + 0.20 * role_score
+            + upstream_gate_bonus
+            + upstream_exclude_penalty
+        )
+
+        evidence_bits = []
+        if in_upstream:
+            evidence_bits.append(f"present in upstream config ({os.path.basename(upstream_source) or 'config.json'})")
+        elif upstream_keys:
+            evidence_bits.append("NOT in upstream config")
+        if score >= 0.7:
+            evidence_bits.append(f"name overlaps '{missing_key}'")
+        elif score >= 0.3:
+            evidence_bits.append(f"partial name overlap '{missing_key}'")
+        if occurrences:
+            evidence_bits.append(f"seen {occurrences}x nearby")
+        if pop_hit:
+            evidence_bits.append("assigned in local window")
+        if role_evidence:
+            evidence_bits.append(role_evidence)
+        if not evidence_bits:
+            evidence_bits.append("no direct evidence")
+
+        candidates.append({
+            "key": key,
+            "confidence": round(confidence, 3),
+            "evidence": "; ".join(evidence_bits),
+            "occurrences": occurrences,
+            "in_upstream": in_upstream,
+        })
+
+    # Sort: confidence desc, upstream-first, occurrences desc, name asc.
+    candidates.sort(key=lambda c: (-c["confidence"], not c["in_upstream"], -c["occurrences"], c["key"]))
+    return candidates[:max_candidates]
+
+
+def _format_candidate_table(
+    candidates: List[Dict[str, Any]],
+    missing_key: str,
+) -> str:
+    if not candidates:
+        return (
+            f"(No replacement candidates found for '{missing_key}' in the local window.)\n"
+            f"This may indicate a format or schema mismatch rather than a wrong key name."
+        )
+    lines = [f"Candidates for missing key '{missing_key}' (ranked by evidence):"]
+    for idx, cand in enumerate(candidates, 1):
+        lines.append(
+            f"  {idx}. \"{cand['key']}\"  "
+            f"confidence={cand['confidence']}  — {cand['evidence']}"
+        )
+    return "\n".join(lines)
+
+
+def _write_stuck_packet(state: Dict[str, Any], signature: str, question: str, candidates: List[Dict[str, Any]]) -> str:
+    """Emit a structured stuck-packet to .agent/stuck.json so unattended runs
+    surface a concrete question rather than silently burning steps."""
+    try:
+        out_dir = os.path.join(os.getcwd(), ".agent")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "stuck.json")
+        payload = {
+            "signature": signature,
+            "question": question,
+            "candidates": candidates,
+            "error_history": (state.get("full_error_history") or [])[-3:],
+            "recent_writes": list(state.get("recent_write_attempts", []))[-5:],
+            "frozen_locations": state.get("frozen_locations", []),
+            "tier": _current_tier(state, signature),
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return out_path
+    except Exception:
+        return ""
+
+
+def _enter_tier1_pinned_read(state: Dict[str, Any], signature: str, target: Dict[str, Any]) -> None:
+    """First-level escalation: pin the next read to a specific location."""
+    _set_tier(state, signature, 1)
+    _set_forced_read(
+        state,
+        file_path=target.get("file") or "",
+        line=int(target.get("line") or 1),
+        reason=target.get("reason") or "tier-1 pinned investigation target",
+        reads=2,
+    )
+
+
+def _enter_tier2_candidate_table(
+    state: Dict[str, Any],
+    chat_history: List[Dict[str, str]],
+    signature: str,
+    missing_key: str,
+    file_path: str,
+    error_line: int,
+    frozen_start: int,
+    frozen_end: int,
+) -> str:
+    """Second-level escalation: freeze the write location, build a structured
+    candidate table, truncate history so the LLM is not re-reading rejected
+    drafts, and hand the LLM a constrained task."""
+    _set_tier(state, signature, 2)
+    _freeze_location(state, file_path, frozen_start, frozen_end)
+    candidates = _build_keyerror_candidate_table(missing_key, file_path, error_line, state=state)
+    state["last_candidates"] = candidates
+
+    table = _format_candidate_table(candidates, missing_key)
+
+    summary = (
+        f"You attempted 2+ write patches for KeyError('{missing_key}') at "
+        f"{file_path}:{error_line}; all were blocked. Writes to that line are "
+        f"now frozen. Pick a candidate from the table below OR request a "
+        f"specific additional read to disprove the table. Do not invent keys."
+    )
+    _truncate_chat_history_on_tier_transition(chat_history, summary=summary)
+
+    guidance = (
+        f"⚠️ ESCALATION TIER 2: Write location {file_path}:{frozen_start}-{frozen_end} is FROZEN.\n"
+        f"{summary}\n\n"
+        f"{table}\n\n"
+        f"If none of these fit, respond with ReadFileInput at a specific line "
+        f"you want to inspect (explain why). If you believe the config/schema is "
+        f"wrong rather than the key, say so explicitly — do not patch the code."
+    )
+    state["current_input"] = guidance
+    state["phase"] = "RAN"
+    chat_history.append({"role": "user", "content": guidance})
+    return guidance
+
+
+def _enter_tier3_user_escalation(
+    state: Dict[str, Any],
+    chat_history: List[Dict[str, str]],
+    signature: str,
+    missing_key: str,
+    file_path: str,
+    error_line: int,
+) -> Dict[str, Any]:
+    """Third-level escalation: surface a concrete question to the user instead
+    of looping.  Interactive mode pauses; unattended mode emits a stuck-packet
+    and returns a sentinel the caller can use to exit cleanly."""
+    _set_tier(state, signature, 3)
+    candidates = state.get("last_candidates") or _build_keyerror_candidate_table(
+        missing_key, file_path, error_line, state=state
+    )
+    table = _format_candidate_table(candidates, missing_key)
+
+    question = (
+        f"Stuck on KeyError('{missing_key}') at {file_path}:{error_line}.\n"
+        f"Automated resolution has exhausted Tier 1 (pinned read) and Tier 2 "
+        f"(candidate table). Need a human decision:\n"
+        f"  (a) pick a candidate from the table,\n"
+        f"  (b) confirm this is a schema/config mismatch (not a code bug),\n"
+        f"  (c) point at a specific file/line you want inspected.\n\n"
+        f"{table}"
+    )
+    state["user_question"] = question
+    state["current_input"] = question
+    packet_path = _write_stuck_packet(state, signature, question, candidates)
+    chat_history.append({"role": "user", "content": f"[TIER 3 ESCALATION]\n{question}"})
+    return {
+        "question": question,
+        "candidates": candidates,
+        "packet_path": packet_path,
+        "signature": signature,
+    }
+
+
+def _apply_candidate_substitution(
+    file_path: str,
+    error_line: int,
+    missing_key: str,
+    replacement_key: str,
+) -> tuple:
+    """Directly substitute `missing_key` → `replacement_key` on `file_path:error_line`.
+
+    Bypasses the LLM entirely.  Opens the file, reads line `error_line`,
+    replaces the first occurrence of `"missing_key"` or `'missing_key'`
+    (with either quote style) with the corresponding quoted replacement,
+    and writes the file back.  Preserves surrounding whitespace and
+    everything else on the line.
+
+    Returns (ok, message).  `ok=False` means the substitution did not match
+    and the file was left untouched.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return False, f"file not found: {file_path}"
+    if error_line <= 0:
+        return False, f"invalid error_line: {error_line}"
+    if not missing_key or not replacement_key:
+        return False, "empty key"
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return False, f"read failed: {e}"
+    if error_line > len(lines):
+        return False, f"error_line {error_line} beyond EOF ({len(lines)} lines)"
+
+    target_line = lines[error_line - 1]
+    # Try double-quoted first, then single-quoted.
+    new_line = target_line
+    replaced = False
+    for quote in ("\"", "'"):
+        needle = f"{quote}{missing_key}{quote}"
+        if needle in new_line:
+            new_line = new_line.replace(needle, f"{quote}{replacement_key}{quote}", 1)
+            replaced = True
+            break
+    if not replaced:
+        return False, (
+            f"missing_key {missing_key!r} not found as a string literal on "
+            f"{file_path}:{error_line}"
+        )
+    # Ensure newline preservation
+    if not new_line.endswith("\n") and target_line.endswith("\n"):
+        new_line += "\n"
+
+    # Write back — preserve file otherwise.
+    try:
+        # Backup-safe write: tmp-file + rename
+        backup_path = f"{file_path}.backup"
+        try:
+            with open(backup_path, "w", encoding="utf-8") as bf:
+                bf.writelines(lines)
+        except Exception:
+            pass
+        lines[error_line - 1] = new_line
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        return False, f"write failed: {e}"
+
+    return True, f"{file_path}:{error_line} — substituted {missing_key!r} → {replacement_key!r}"
+
+
+def _should_enter_tier(signature: str, block_count: int) -> int:
+    """Decide the tier to enter for a given cumulative block count.
+    1 block  -> Tier 1,  2 blocks -> Tier 2,  3+ blocks -> Tier 3."""
+    if not signature:
+        return 0
+    if block_count >= 3:
+        return 3
+    if block_count >= 2:
+        return 2
+    if block_count >= 1:
+        return 1
+    return 0
+
+
+def _prompt_tier_escalation(
+    state: Dict[str, Any],
+    signature: str,
+    from_tier: int,
+    to_tier: int,
+    missing_key: str,
+    candidates: List[Dict[str, Any]] | None = None,
+    context: str = "",
+) -> tuple:
+    """Interactive gate before climbing the tier ladder.
+
+    Mirrors the RunScriptInput approval UX: the user can approve the climb,
+    provide a free-form insight that resets the ladder and hands the LLM a
+    fresh hint, or stop the run outright.
+
+    Returns one of:
+      ("approve", "")              — proceed with the tier transition
+      ("insight", <user text>)     — apply insight, do NOT escalate, reset
+                                     the signature counter so the LLM gets a
+                                     fresh attempt armed with the new hint
+      ("stop", "")                 — abort the run cleanly
+
+    Skips the prompt entirely (auto-approve) when interactive review is off,
+    so unattended runs still escalate instead of blocking on input.
+    """
+    if not state.get("interactive_action_review", True):
+        return "approve", ""
+
+    print("\n" + "─" * 80)
+    print(f"Tier Escalation Approval · {from_tier} → {to_tier}")
+    print("─" * 80)
+    if missing_key:
+        print(f"  ◆ Missing key    {missing_key!r}")
+    if signature:
+        print(f"  ◆ Signature      {signature}")
+    if context:
+        print(f"  ◆ Context        {context}")
+    if candidates:
+        print("  ◆ Top candidates:")
+        for idx, cand in enumerate(candidates[:5], 1):
+            print(f"       {idx}. \"{cand.get('key')}\"  conf={cand.get('confidence')}  — {cand.get('evidence')}")
+    tier_descriptions = {
+        1: "pinned read at investigation target",
+        2: "freeze write location, inject candidate table",
+        3: "human escalation — stop automated attempts",
+    }
+    target_desc = tier_descriptions.get(to_tier, "escalate")
+    print(f"\n  ◆ About to        {target_desc}")
+    print("Options:")
+    print("  [y] approve and escalate")
+    print("  [i] provide insight instead (resets ladder so LLM retries with your hint)")
+    if candidates:
+        print(f"  [1-{min(len(candidates), 5)}] apply candidate N directly (substitute on the error line, bypass LLM)")
+    print("  [n] stop the run here")
+    options_str = "y/i/n" if not candidates else f"y/i/1-{min(len(candidates), 5)}/n"
+    choice = safe_input(f"Select option [{options_str}]: ").strip().lower() or "y"
+
+    # Numbered-candidate pick: fast path that skips the LLM entirely.
+    if candidates and choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= min(len(candidates), 5):
+            picked = candidates[idx - 1]
+            picked_key = str(picked.get("key") or "").strip()
+            if picked_key:
+                # Reset ladder and whitelist so nothing downstream rejects it.
+                counts = state.get("signature_block_counts") or {}
+                if signature in counts:
+                    counts[signature] = 0
+                state.setdefault("signature_tiers", {})[signature] = 0
+                state["forced_next_action"] = None
+                state["artifact_read_target"] = {}
+                state["pin_reads_remaining"] = 0
+                state["frozen_locations"] = []
+                approved = state.setdefault("user_approved_keys", set())
+                if not isinstance(approved, set):
+                    approved = set(approved or [])
+                    state["user_approved_keys"] = approved
+                approved.add(picked_key)
+                print(f"   ✅ User picked candidate {idx}: \"{picked_key}\"")
+                return "pick", picked_key
+
+    if choice in {"y", "yes", ""}:
+        return "approve", ""
+    if choice in {"n", "no", "stop"}:
+        # Hard halt: set a state flag the main loop checks immediately after
+        # get_user_approval_for_action.  This avoids relying on the caller's
+        # (False, reason) return being correctly interpreted as run-stop vs
+        # turn-rejection.
+        state["halt_requested"] = True
+        state["halt_reason"] = "user stopped at tier escalation prompt"
+        return "stop", ""
+    if choice in {"i", "insight"}:
+        hint = safe_input("Your insight for the LLM (single line): ").strip()
+        if hint:
+            # Reset the signature's block counter so the LLM isn't
+            # immediately re-escalated, and drop any active freeze/pin.
+            counts = state.get("signature_block_counts") or {}
+            if signature in counts:
+                counts[signature] = 0
+            state.setdefault("signature_tiers", {})[signature] = 0
+            state["forced_next_action"] = None
+            state["artifact_read_target"] = {}
+            state["pin_reads_remaining"] = 0
+            # Remove any frozen ranges associated with this signature so the
+            # LLM can act on the insight.
+            state["frozen_locations"] = []
+
+            # Extract any key names the user mentioned and whitelist them so
+            # the UNSUPPORTED KEY REPLACEMENT validator treats them as
+            # justified evidence.  Pattern sources:
+            #   - quoted strings  "foo", 'foo'
+            #   - bracket access  hparams["foo"] / cfg['foo']
+            #   - bare snake_case tokens (word_with_underscores) — users
+            #     often drop quotes when giving insights like
+            #     "try block_multiple_of"; without this extraction the hint
+            #     doesn't actually whitelist the key and the validator later
+            #     blocks the correct substitution.
+            approved = state.setdefault("user_approved_keys", set())
+            if not isinstance(approved, set):
+                approved = set(approved or [])
+                state["user_approved_keys"] = approved
+            for m in re.finditer(r"[\"\']([A-Za-z_][A-Za-z0-9_]*)[\"\']", hint):
+                approved.add(m.group(1))
+            for m in re.finditer(r"\[\s*[\"\']([A-Za-z_][A-Za-z0-9_]*)[\"\']\s*\]", hint):
+                approved.add(m.group(1))
+            # Bare snake_case: at least one underscore between word chars.
+            # Filter out English words that happen to contain underscores
+            # with a stopword list.
+            _stop = {"self_hparams", "do_not", "not_in", "as_is", "keep_as"}
+            for m in re.finditer(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b", hint.lower()):
+                token = m.group(1)
+                if token in _stop:
+                    continue
+                approved.add(token)
+            if approved:
+                print(f"   ✅ User-approved keys (whitelist): {sorted(approved)}")
+
+            # Chat-history truncation: when the ladder resets via user
+            # insight, collapse recent assistant/user turns into a single
+            # summary so the LLM stops echoing its own rejected drafts.
+            # Without this, the LLM reads its prior blocked proposal as a
+            # template and reproposes the same bad write verbatim.
+            # Caller is responsible for passing chat_history via state; we
+            # store a truncation request here and the main loop acts on it.
+            state["truncate_history_on_next_turn"] = (
+                f"User provided an insight to break a block loop. Ignore prior "
+                f"rejected drafts. New rule: {hint}"
+            )
+            return "insight", hint
+        return "approve", ""
+    # Anything else treated as approve to preserve the RunScript UX default.
+    return "approve", ""
+
+
 def is_library_or_utility_file(file_path: str) -> tuple:
     """
     Check if a file is part of a library or shared utility that shouldn't be edited.
@@ -658,43 +1571,97 @@ def validate_write_safety(
         current_error_msg = last_error.get("message", "")
     
     if current_error_type == "KeyError":
+        missing_key = str(current_error_msg or "").strip().strip("'\"")
+
         # Block ANY .get() pattern when fixing KeyError - must find correct key
-        get_match = re.search(r'\.get\s*\(\s*["\']([^"\']+)["\']', new_content)
+        get_match = re.search(r"\.get\s*\(\s*[\"']([^\"']+)[\"']", new_content)
         if get_match:
             attempted_key = get_match.group(1)
-            
-            # Try to find similar keys in the file
+            error_line = int(state.get("error_line", 0) or 0)
+            investigation_target = _infer_keyerror_investigation_target(file_path, error_line)
+            if investigation_target:
+                state["artifact_read_target"] = investigation_target
+
+            # Only gather candidate keys from nearby accesses on the SAME object/dict.
             similar_keys = []
             if file_path and os.path.exists(file_path):
                 try:
-                    with open(file_path, 'r') as f:
-                        content = f.read()
-                    # Find dict access patterns near the error
-                    key_pattern = re.findall(r'\[[\"\']([^\"\']+)[\"\']\]', content)
-                    # Find keys that share parts with the attempted key
-                    attempted_parts = set(attempted_key.lower().split('_'))
-                    for key in set(key_pattern):
-                        key_parts = set(key.lower().split('_'))
-                        if attempted_parts & key_parts:  # Any common parts
-                            similar_keys.append(key)
-                    similar_keys = list(set(similar_keys))[:5]  # Top 5 unique
-                except:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+
+                    dict_name = None
+                    if 1 <= error_line <= len(lines):
+                        error_code = lines[error_line - 1]
+                        dict_match = re.search(r"(?:\w+\.)?(\w+)\[[\'\"](.*?)[\'\"]\]", error_code)
+                        if dict_match:
+                            dict_name = dict_match.group(1)
+
+                    if dict_name:
+                        search_start = max(0, error_line - 31)
+                        search_end = min(len(lines), error_line + 10)
+                        pattern = rf"(?:\w+\.)?{dict_name}\[[\'\"](\w+)[\'\"]\]"
+                        for i in range(search_start, search_end):
+                            for key in re.findall(pattern, lines[i]):
+                                if key != attempted_key and key not in similar_keys:
+                                    similar_keys.append(key)
+                        similar_keys = similar_keys[:8]
+                except Exception:
                     pass
-            
-            suggestion = ""
+
+            suggestion = "\n\nNext step: READ more context before changing the key name."
+            if investigation_target:
+                suggestion += (
+                    f"\nRead target: {investigation_target['file']}:{investigation_target['line']}"
+                    f" ({investigation_target['reason']})."
+                )
             if similar_keys:
-                suggestion = f"\n\n💡 SIMILAR KEYS FOUND IN CODEBASE:\n"
-                state["last_similar_keys"] = similar_keys  # Store for later use
+                state["last_similar_keys"] = similar_keys
+                suggestion += "\n\nNearby keys on the same object/dict:\n"
                 for key in similar_keys:
                     suggestion += f"   - \"{key}\"\n"
-                suggestion += f"\nTry one of these with DIRECT ACCESS: [\"{similar_keys[0]}\"]"
-            
+                suggestion += "\nUse one only if the surrounding code proves it is the correct semantic match."
+
             return False, (
                 f"⛔ BAD PATTERN: Using .get(\"{attempted_key}\", ...) does NOT fix KeyError.\n"
-                f"The key doesn't exist - you must find the CORRECT key name.\n"
-                f"Use DIRECT ACCESS syntax: [\"correct_key\"] not .get(\"key\", fallback)"
+                f"The missing key name must be justified from local code context, not guessed from a fallback.\n"
+                f"Do not invent a default. Read the surrounding code and find the correct field name."
                 f"{suggestion}"
             ), True
+
+        replacement_match = re.search(r'\[\s*[\"\']([^\"\']+)[\"\']\s*\]', new_content)
+        if replacement_match and missing_key:
+            replacement_key = replacement_match.group(1)
+            if replacement_key != missing_key:
+                evidence_blob = state.get("last_file_text", "") or ""
+                known_keys = state.get("last_similar_keys", []) or []
+                user_approved = state.get("user_approved_keys", set()) or set()
+                # If the user has explicitly approved this key via an insight,
+                # it counts as justification even when the LLM hasn't re-read
+                # a window that contains it.  Similarly for keys discovered
+                # upstream from the actual config source.
+                upstream_keys_set: set = set()
+                try:
+                    uk_raw = state.get("upstream_config_keys")
+                    if isinstance(uk_raw, (set, list, tuple)):
+                        upstream_keys_set = set(uk_raw)
+                except Exception:
+                    pass
+                quoted_replacement = {f'"{replacement_key}"', f"'{replacement_key}'"}
+                evidenced_in_read = any(token in evidence_blob for token in quoted_replacement)
+                evidenced_in_keys = replacement_key in known_keys
+                evidenced_in_upstream = replacement_key in upstream_keys_set
+                evidenced_by_user = replacement_key in user_approved
+
+                if not (evidenced_in_read or evidenced_in_keys or evidenced_in_upstream or evidenced_by_user):
+                    error_line = int(state.get("error_line", 0) or 0)
+                    investigation_target = _infer_keyerror_investigation_target(file_path, error_line)
+                    if investigation_target:
+                        state["artifact_read_target"] = investigation_target
+                    return False, (
+                        f"⛔ UNSUPPORTED KEY REPLACEMENT: '{replacement_key}' is not justified by the current local context.\n"
+                        f"You are fixing KeyError for '{missing_key}'. Do not substitute a different key unless that exact field appears in the code you just read.\n"
+                        f"Read where the object/dict is populated first, then choose the semantically correct key."
+                    ), True
     else:
         # For non-KeyError, only block .get(..., None) which causes TypeError
         if re.search(r'\.get\s*\([^,]+,\s*None\s*\)', new_content):
@@ -941,6 +1908,11 @@ def allowed_actions(state: Dict[str, Any]) -> List[str]:
             actions.append("RAGSearchInput")
         return actions
     if phase == "READ":
+        if state.get("artifact_read_target"):
+            actions = ["ReadFileInput"]
+            if rag_allowed:
+                actions.append("RAGSearchInput")
+            return actions
         actions = ["WriteFileInput", "ReadFileInput"]
         if rag_allowed:
             actions.append("RAGSearchInput")
@@ -1392,6 +2364,34 @@ def _summarize_terminal_result_for_prompt(command: str, result: Dict[str, Any]) 
     return "\n\n".join(parts)
 
 
+def _extract_traceback_tail(text: str) -> str:
+    """Return the slice starting at the LAST 'Traceback' line onwards.
+
+    Python's 'Traceback (most recent call last):' is the standard marker for
+    where a crash's useful context begins.  Grabbing from that point
+    eliminates the early subprocess noise (import warnings, progress bars,
+    llama.cpp banners) and keeps the actionable part.
+
+    Falls back to the last ~60 lines if no Traceback marker is present.
+    """
+    if not text:
+        return ""
+    idx = text.rfind("Traceback (most recent call last):")
+    if idx < 0:
+        # Secondary fallback: some scripts print generic Python error lines.
+        for marker in ("Error:", "Exception:"):
+            idx = text.rfind(marker)
+            if idx >= 0:
+                # Step back to the start of that line.
+                line_start = text.rfind("\n", 0, idx)
+                idx = line_start + 1 if line_start >= 0 else 0
+                break
+    if idx < 0:
+        tail_lines = text.splitlines()[-60:]
+        return "\n".join(tail_lines)
+    return text[idx:]
+
+
 def review_latest_run_output(state: Dict[str, Any], label: str = "script run") -> None:
     """Offer an interactive terminal menu for reviewing the latest run output."""
     if not state.get("interactive_output_review", True):
@@ -1401,20 +2401,44 @@ def review_latest_run_output(state: Dict[str, Any], label: str = "script run") -
     stderr = state.get("last_stderr", "") or ""
     exitcode = state.get("last_exitcode")
 
+    # If stdout is empty but the script crashed, Python writes the traceback
+    # to stderr — flag that so users don't wonder where the output went.
+    stdout_note = ""
+    if not stdout.strip() and stderr.strip() and (exitcode not in (0, None)):
+        stdout_note = "  (empty — crashes write to stderr, use option 6)"
+
+    # Peek at additional saved-log locations some runs write to.  If any of
+    # these have content for the current run, surface their paths so the
+    # user knows where else to look.
+    extra_log_paths: List[str] = []
+    for candidate in (
+        os.path.join(os.getcwd(), "current_outputs.json"),
+        os.path.join(os.getcwd(), ".setup_logs"),
+        os.path.join(os.getcwd(), ".agent"),
+    ):
+        if os.path.exists(candidate):
+            extra_log_paths.append(candidate)
+
     _print_console_panel(f"Output Review · {label}", tone="review")
     _print_labeled_value("Exit", str(exitcode), tone="review")
-    _print_labeled_value("Stdout chars", str(len(stdout)), tone="review")
+    _print_labeled_value("Stdout chars", f"{len(stdout)}{stdout_note}", tone="review")
     _print_labeled_value("Stderr chars", str(len(stderr)), tone="review")
+    if extra_log_paths:
+        _print_labeled_value("Log paths", ", ".join(extra_log_paths), tone="review")
 
     while True:
         choice = safe_input(
-            "Output options [Enter continue, 1 stdout, 2 stderr, 3 combined tail, 4 saved log, 5 disable prompts]: "
+            "Output options [Enter continue, 1 stdout, 2 stderr, 3 combined tail, "
+            "4 saved log, 5 disable prompts, 6 Traceback onwards]: "
         ).strip().lower()
         if choice in {"", "c", "continue"}:
             return
         if choice == "1":
             _print_console_panel("STDOUT", tone="review")
-            print(_preview_text_block(stdout, max_chars=6000))
+            if not stdout.strip():
+                print("(empty — if the script crashed, check option 6 for the traceback)")
+            else:
+                print(_preview_text_block(stdout, max_chars=6000))
             continue
         if choice == "2":
             _print_console_panel("STDERR", tone="review")
@@ -1435,6 +2459,20 @@ def review_latest_run_output(state: Dict[str, Any], label: str = "script run") -
             state["interactive_output_review"] = False
             print("   Output review prompts disabled for the rest of this session.")
             return
+        if choice in {"6", "t", "trace", "traceback"}:
+            # Prefer stderr (Python writes tracebacks there), fall back to
+            # stdout or combined if stderr has no traceback marker.
+            trace = _extract_traceback_tail(stderr)
+            if not trace.strip():
+                trace = _extract_traceback_tail(stdout)
+            if not trace.strip():
+                trace = _extract_traceback_tail("\n".join(p for p in [stdout, stderr] if p))
+            _print_console_panel("Traceback (tail)", tone="review")
+            if trace.strip():
+                print(_preview_text_block(trace, max_chars=6000))
+            else:
+                print("(no 'Traceback' marker found in captured output)")
+            continue
         print("   Invalid choice.")
 
 
@@ -1506,6 +2544,345 @@ def get_user_approval_for_action(action: AgentAction, state: Dict[str, Any]) -> 
 
     is_library_write = False
     if action.action_type == "WriteFileInput":
+        act = action.action
+
+        # ================================================================
+        # KEYERROR SITE PROXIMITY CHECK
+        #
+        # When the agent is fixing a KeyError at file:L, the write must
+        # land near L.  The LLM has been caught writing correct-looking
+        # patches hundreds of lines away from the error — most damagingly
+        # over the IMPORT section at the top of the file, which corrupts
+        # the whole module with a SyntaxError that no longer bears any
+        # resemblance to the original bug.
+        #
+        # Reject any write farther than PROXIMITY_LINES from the recorded
+        # error line unless the target file differs entirely (cross-file
+        # refactors remain allowed) or the error is not a KeyError.
+        # ================================================================
+        _last_err = (state.get("full_error_history") or [{}])[-1] or {}
+        _err_type = str(_last_err.get("error_type") or "")
+        _err_file = str(_last_err.get("file") or state.get("last_error_file") or "")
+        _err_line = int(_last_err.get("line") or state.get("error_line") or 0)
+        PROXIMITY_LINES = 80  # generous window that still catches import-zone writes
+        if (
+            _err_type == "KeyError"
+            and _err_file
+            and _err_line > 0
+            and os.path.normpath(act.file_path or "") == os.path.normpath(_err_file)
+        ):
+            write_start = int(act.start_line or 0)
+            write_end = int(act.end_line or act.start_line or 0)
+            distance = 0
+            if write_end < _err_line:
+                distance = _err_line - write_end
+            elif write_start > _err_line:
+                distance = write_start - _err_line
+            if distance > PROXIMITY_LINES:
+                msg = (
+                    f"⛔ LOCATION MISMATCH: You proposed writing at "
+                    f"{act.file_path}:{write_start}-{write_end} but the active "
+                    f"KeyError is at line {_err_line}.  Distance {distance} lines "
+                    f"exceeds the {PROXIMITY_LINES}-line safety window.\n"
+                    f"Your write would almost certainly corrupt unrelated code. "
+                    f"Make the fix at or near line {_err_line}."
+                )
+                print(f"   📍 {msg}")
+                # Count as a block event so the tier ladder advances — this
+                # pattern (write-far-from-error) usually means the LLM has
+                # lost the plot and needs human intervention.
+                signature = _error_signature(
+                    state,
+                    fallback_file=_err_file,
+                    fallback_line=_err_line,
+                )
+                if signature:
+                    _increment_signature_block(state, signature)
+                return False, msg
+
+        # Preflight: mechanically refuse writes to frozen locations.  The
+        # Tier 2 transition pins these — we must reject *before* the approval
+        # prompt so the user never sees another variant of the same rejected
+        # fix.  Each frozen-rejection ALSO counts as a block event on the
+        # signature ladder so that repeated attempts escalate to Tier 3
+        # (human escalation) instead of spinning forever at Tier 2.
+        if _is_location_frozen(state, act.file_path, act.start_line or 1, act.end_line or act.start_line or 1):
+            error_line = int(state.get("error_line", 0) or 0)
+            error_file = state.get("last_error_file") or act.file_path
+            signature = _error_signature(
+                state,
+                fallback_file=error_file,
+                fallback_line=error_line or (act.start_line or 0),
+            )
+            block_count = _increment_signature_block(state, signature) if signature else 0
+            target_tier = _should_enter_tier(signature, block_count)
+            print(f"   🪜 TIER ladder (frozen-reject): sig={signature} count={block_count} → tier={target_tier}")
+
+            missing_key = ""
+            if state.get("full_error_history"):
+                last_err = state["full_error_history"][-1] or {}
+                if last_err.get("error_type") == "KeyError":
+                    missing_key = str(last_err.get("message") or "").strip().strip("'\"")
+
+            # Tier 3: escalate to a human question rather than keep looping.
+            if target_tier >= 3:
+                candidates = state.get("last_candidates") or _build_keyerror_candidate_table(
+                    missing_key, error_file, error_line, state=state
+                )
+                state["last_candidates"] = candidates
+
+                decision, insight = _prompt_tier_escalation(
+                    state=state,
+                    signature=signature,
+                    from_tier=_current_tier(state, signature),
+                    to_tier=3,
+                    missing_key=missing_key,
+                    candidates=candidates,
+                    context=f"frozen-reject block {block_count} at {act.file_path}:{act.start_line}",
+                )
+                if decision == "stop":
+                    return False, "User requested stop at tier-3 approval prompt."
+                if decision == "pick" and insight:
+                    ok, msg = _apply_candidate_substitution(
+                        error_file, error_line, missing_key, insight
+                    )
+                    print(f"   🛠️  Direct candidate substitution: {msg}")
+                    if ok:
+                        return False, (
+                            f"✅ User picked candidate '{insight}'. "
+                            f"{msg}. Rerun the script to verify."
+                        )
+                    # Fall through to insight-style flow if substitution failed.
+                    return False, (
+                        f"⚠️ Direct substitution failed: {msg}\n"
+                        f"Try again with .get/insight or stop and edit manually."
+                    )
+                if decision == "insight" and insight:
+                    print(f"   💡 User insight accepted — ladder reset, hint forwarded to LLM.")
+                    return False, (
+                        f"⚠️ USER INSIGHT (ladder reset):\n{insight}\n\n"
+                        f"Apply this hint. Do NOT repeat the blocked pattern."
+                    )
+
+                table = _format_candidate_table(candidates, missing_key)
+                question = (
+                    f"Stuck on KeyError('{missing_key}') at {error_file}:{error_line}.\n"
+                    f"Automated tiers 1+2 exhausted; multiple write attempts rejected at frozen "
+                    f"location. Need a human decision:\n"
+                    f"  (a) pick a candidate from the table,\n"
+                    f"  (b) confirm schema/config mismatch,\n"
+                    f"  (c) point at a specific file/line to inspect.\n\n{table}"
+                )
+                state["user_question"] = question
+                packet_path = _write_stuck_packet(state, signature, question, candidates)
+                print(f"   🚨 TIER 3: user escalation (via frozen reject). Stuck-packet: {packet_path or '(not written)'}")
+                return False, f"[TIER 3 ESCALATION]\n{question}"
+
+            # Otherwise stay at Tier 2 — re-pin the investigation target and
+            # bounce the write.
+            msg = (
+                f"⛔ FROZEN LOCATION: {act.file_path}:{act.start_line}-{act.end_line} is frozen "
+                f"after repeated blocked patches for this error signature. Read a different "
+                f"location or escalate — do not retry a write here."
+            )
+            print(f"   🧊 {msg}")
+            pin_target = state.get("artifact_read_target") or _infer_keyerror_investigation_target(
+                act.file_path,
+                int(state.get("error_line", act.start_line or 1) or 1),
+            )
+            if pin_target and pin_target.get("file"):
+                _set_forced_read(
+                    state,
+                    file_path=pin_target["file"],
+                    line=int(pin_target.get("line") or 1),
+                    reason=pin_target.get("reason") or "frozen-location investigation target",
+                    reads=2,
+                )
+            return False, msg
+
+        # Pre-apply indentation fix so single-line replacements submitted
+        # without leading whitespace aren't falsely flagged as IndentationError
+        # by the syntax validator.  The dispatch handler already does this
+        # before its own validation; the approval gate must too or approved
+        # writes never land.
+        content_for_validation = act.new_content or ""
+        if act.start_line and os.path.exists(act.file_path):
+            try:
+                with open(act.file_path, "r", encoding="utf-8") as _f:
+                    _orig_lines = _f.readlines()
+                content_for_validation = preserve_multiline_indentation(
+                    content_for_validation,
+                    _orig_lines,
+                    act.start_line,
+                    act.end_line or act.start_line,
+                )
+            except Exception:
+                pass
+
+        is_safe, reason, should_continue = validate_write_safety(
+            act.file_path,
+            content_for_validation,
+            act.start_line,
+            act.end_line,
+            state,
+        )
+        if not is_safe:
+            print(f"   {reason}")
+
+            # ================================================================
+            # TIER LADDER (approval-gate site)
+            # This is where write-blocks ACTUALLY fire — validate_write_safety
+            # runs inside the approval gate, so the main-loop dispatch never
+            # receives blocked writes.  The ladder must therefore live here.
+            # State mutations (forced_next_action, frozen_locations) persist
+            # across loop iterations and drive the next action.
+            # ================================================================
+            if "BAD PATTERN" in reason or "UNSUPPORTED KEY REPLACEMENT" in reason:
+                error_line = int(state.get("error_line", 0) or 0)
+                error_file = state.get("last_error_file") or act.file_path
+                signature = _error_signature(
+                    state,
+                    fallback_file=error_file,
+                    fallback_line=error_line or (act.start_line or 0),
+                )
+                block_count = _increment_signature_block(state, signature) if signature else 0
+                target_tier = _should_enter_tier(signature, block_count)
+                print(f"   🪜 TIER ladder: sig={signature} count={block_count} → tier={target_tier}")
+
+                missing_key = ""
+                if state.get("full_error_history"):
+                    last_err = state["full_error_history"][-1] or {}
+                    if last_err.get("error_type") == "KeyError":
+                        missing_key = str(last_err.get("message") or "").strip().strip("'\"")
+
+                # Precompute candidates so the approval prompt can show them.
+                preview_candidates = _build_keyerror_candidate_table(
+                    missing_key, error_file, error_line, state=state
+                )
+
+                # Interactive tier-escalation approval.  Mirrors the RunScript
+                # approval UX — user can approve, provide insight (reset the
+                # ladder + feed the LLM a hint), or stop.
+                decision, insight = _prompt_tier_escalation(
+                    state=state,
+                    signature=signature,
+                    from_tier=_current_tier(state, signature),
+                    to_tier=target_tier,
+                    missing_key=missing_key,
+                    candidates=preview_candidates,
+                    context=f"block {block_count} at {error_file}:{error_line}",
+                )
+
+                if decision == "stop":
+                    state["user_question"] = "User stopped the run at tier approval prompt."
+                    return False, "User requested stop at tier escalation prompt."
+
+                if decision == "pick" and insight:
+                    # Direct candidate substitution — apply to the error line
+                    # right now, bypassing the LLM.  Fast path when the user
+                    # can see the right answer in the candidate table.
+                    ok, msg = _apply_candidate_substitution(
+                        error_file, error_line, missing_key, insight
+                    )
+                    print(f"   🛠️  Direct candidate substitution: {msg}")
+                    if ok:
+                        # Resolution for this signature: drop the stale error
+                        # so the BAD PATTERN validator doesn't re-fire on the
+                        # same line, queue a forced RunScriptInput for the
+                        # next turn so we actually verify the fix instead of
+                        # letting the LLM propose another write.
+                        state["phase"] = "WROTE"
+                        if state.get("full_error_history"):
+                            try:
+                                state["full_error_history"].pop()
+                            except Exception:
+                                pass
+                        if signature:
+                            (state.get("signature_block_counts") or {})[signature] = 0
+                            state.setdefault("signature_tiers", {})[signature] = 0
+                        state["forced_next_action"] = {
+                            "kind": "RunScriptInput",
+                            "script_path": state.get("target_file", ""),
+                            "args": state.get("run_args", []) or [],
+                            "reason": f"verify candidate substitution {insight!r}",
+                        }
+                        state["halt_requested"] = False
+                        return False, (
+                            f"✅ User picked candidate '{insight}'. {msg}. "
+                            f"Next step is a forced re-run to verify."
+                        )
+                    return False, (
+                        f"⚠️ Direct substitution failed: {msg}\n"
+                        f"The line may already be fixed or the missing key isn't a "
+                        f"literal on that line.  Stop (n) and rerun, or pick a different candidate."
+                    )
+
+                if decision == "insight" and insight:
+                    # Reset ladder (already done inside the prompt helper) and
+                    # hand the LLM the user's hint as rejection feedback.
+                    print(f"   💡 User insight accepted — ladder reset, hint forwarded to LLM.")
+                    return False, (
+                        f"⚠️ USER INSIGHT (ladder reset):\n{insight}\n\n"
+                        f"Apply this hint to your next action. Do NOT repeat the previously blocked pattern."
+                    )
+
+                # decision == "approve"
+                if target_tier == 1:
+                    target = (
+                        state.get("artifact_read_target")
+                        or _infer_keyerror_investigation_target(error_file, error_line)
+                    )
+                    if target:
+                        _enter_tier1_pinned_read(state, signature, target)
+                        print(f"   🔄 TIER 1: pinned read to {target['file']}:{target['line']}")
+                        return False, (
+                            f"⚠️ ESCALATION TIER 1: Write blocked. The next action is a FORCED READ at "
+                            f"{target['file']}:{target['line']} ({target['reason']}). Use that context to "
+                            f"identify the correct key or confirm a schema mismatch."
+                        )
+
+                if target_tier == 2:
+                    _freeze_location(
+                        state,
+                        act.file_path,
+                        act.start_line or error_line,
+                        act.end_line or act.start_line or error_line,
+                    )
+                    state["last_candidates"] = preview_candidates
+                    table = _format_candidate_table(preview_candidates, missing_key)
+                    # Intentionally do NOT pin a forced read here — the LLM
+                    # needs a turn to process the candidate table.  Forced
+                    # reads at Tier 2 drowned out the table in earlier runs.
+                    print(f"   🧊 TIER 2: froze {act.file_path}:{act.start_line}-{act.end_line}")
+                    # Print the candidate table to the console too so the user
+                    # sees it at Tier 2, not only at Tier 3.
+                    print("\n" + "─" * 80)
+                    print("Candidate Table (Tier 2)")
+                    print("─" * 80)
+                    print(table)
+                    print("─" * 80 + "\n")
+                    return False, (
+                        f"⚠️ ESCALATION TIER 2: Write location is FROZEN.\n"
+                        f"Stop patching this line. Pick a candidate below OR request a "
+                        f"specific additional read.\n\n{table}"
+                    )
+
+                if target_tier >= 3:
+                    state["last_candidates"] = preview_candidates
+                    table = _format_candidate_table(preview_candidates, missing_key)
+                    question = (
+                        f"Stuck on KeyError('{missing_key}') at {error_file}:{error_line}.\n"
+                        f"Tiers 1+2 exhausted. Need a human decision:\n"
+                        f"  (a) pick a candidate from the table,\n"
+                        f"  (b) confirm this is a schema/config mismatch,\n"
+                        f"  (c) point at a specific file/line to inspect.\n\n{table}"
+                    )
+                    state["user_question"] = question
+                    packet_path = _write_stuck_packet(state, signature, question, preview_candidates)
+                    print(f"   🚨 TIER 3: user escalation. Stuck-packet: {packet_path or '(not written)'}")
+                    return False, f"[TIER 3 ESCALATION]\n{question}"
+
+            return False, reason
         is_library_write = is_library_or_utility_file(action.action.file_path)[0]
 
     _print_console_panel("Approval Required", tone="warn")
@@ -1745,11 +3122,59 @@ STATE SUMMARY:
 
     # === LOOP DETECTION ===
     action_signature = json.dumps(action.model_dump(), sort_keys=True)
-    
+
+    # Tier-ladder guard: if we're mid-escalation (Tier 2+) the repeated reads
+    # are the ladder's FORCED investigation, not an LLM loop.  Switching to
+    # RunScriptInput here would reset progress and mask the stuck state.  In
+    # that case, synthesize a Tier 3 escalation directly.
+    _sig_for_guard = _error_signature(state) if state else ""
+    _tier_now = _current_tier(state, _sig_for_guard) if state else 0
+    if _tier_now >= 2 and action.action_type == "ReadFileInput":
+        loop_guard_ok = True
+    else:
+        loop_guard_ok = False
+
     if len(RECENT_ACTIONS) >= MAX_REPEATED_ACTIONS:
         recent_sigs = [json.dumps(a, sort_keys=True) for a in RECENT_ACTIONS[-MAX_REPEATED_ACTIONS:]]
-        
+
         if all(sig == action_signature for sig in recent_sigs):
+            if loop_guard_ok:
+                # Tier-ladder is actively forcing reads.  Trigger a Tier 3
+                # escalation right here rather than letting the script rerun.
+                print(f"   ⚠️ LOOP under tier-{_tier_now} forced reads — escalating to Tier 3")
+                error_line = int(state.get("error_line", 0) or 0)
+                error_file = state.get("last_error_file") or state.get("target_file", "")
+                missing_key = ""
+                if state.get("full_error_history"):
+                    last_err = state["full_error_history"][-1] or {}
+                    if last_err.get("error_type") == "KeyError":
+                        missing_key = str(last_err.get("message") or "").strip().strip("'\"")
+                candidates = state.get("last_candidates") or _build_keyerror_candidate_table(
+                    missing_key, error_file, error_line, state=state
+                )
+                state["last_candidates"] = candidates
+                table = _format_candidate_table(candidates, missing_key)
+                question = (
+                    f"Stuck on KeyError('{missing_key}') at {error_file}:{error_line}.\n"
+                    f"Automated escalation exhausted — forced reads are looping.\n"
+                    f"Need a human decision:\n"
+                    f"  (a) pick a candidate from the table,\n"
+                    f"  (b) confirm schema/config mismatch,\n"
+                    f"  (c) point at a specific file/line to inspect.\n\n{table}"
+                )
+                state["user_question"] = question
+                packet_path = _write_stuck_packet(state, _sig_for_guard, question, candidates)
+                print(f"   🚨 TIER 3: user escalation (loop-detector). Stuck-packet: {packet_path or '(not written)'}")
+                print("\n" + "=" * 80)
+                print(question)
+                print("=" * 80)
+                _set_tier(state, _sig_for_guard, 3)
+                RECENT_ACTIONS.clear()
+                # NoAction here will stop the loop cleanly from the dispatch side.
+                return AGENT_ACTION_ADAPTER.validate_python({
+                    "action_type": "NoAction",
+                    "action": {},
+                })
             print(f"   ⚠️ LOOP DETECTED: Same action repeated {MAX_REPEATED_ACTIONS} times")
             
             # If stuck on WriteFileInput, the file is probably corrupted
@@ -1883,11 +3308,11 @@ CODE CONTEXT (around the error):
     if error_type == "KeyError" and similar_keys:
         missing_key = error_message.strip("'\"")
         prompt += f"""
-IMPORTANT CONTEXT - Valid keys found in nearby code:
+IMPORTANT CONTEXT - Nearby keys found on the same object/dict:
 {similar_keys}
 
-Notice any naming patterns in these valid keys (common prefixes, suffixes, conventions).
-The missing key '{missing_key}' is probably a typo or uses the wrong naming convention.
+Use these only as local evidence. Do not blindly swap to the first similar-looking key.
+The replacement must match the surrounding code semantics, not just the naming pattern.
 """
 
     if runtime_context:
@@ -4840,7 +6265,17 @@ def run_llm_debug_agent(
         "rag_eligible": False,
         "rag_reason": "",
         "user_requested_rag": False,
-        "force_rag": False,
+        # Tier-ladder fields (see TIER LADDER section for semantics)
+        "forced_next_action": None,
+        "frozen_locations": [],
+        "signature_block_counts": {},
+        "signature_tiers": {},
+        "pin_reads_remaining": 0,
+        "user_question": "",
+        "last_candidates": [],
+        "user_approved_keys": set(),
+        "upstream_config_keys": set(),
+        "upstream_config_source": "",
         "debug": debug_mode,
         "interactive_output_review": interactive_output_review,
         "interactive_action_review": interactive_action_review,
@@ -4881,9 +6316,214 @@ def run_llm_debug_agent(
     for step in range(max_steps):
         state["current_step"] = step
         _print_step_header(step + 1, max_steps, state["phase"], state.get("mocking_phase", "N/A"))
-        
+
+        # Chat-history truncation requested by a user insight: collapse the
+        # middle turns into one summary turn so the LLM can't echo its own
+        # rejected drafts on this step.
+        truncation_msg = state.pop("truncate_history_on_next_turn", None)
+        if truncation_msg:
+            _truncate_chat_history_on_tier_transition(
+                chat_history,
+                summary=truncation_msg,
+                keep_first=1,
+                keep_last=1,
+            )
+            print("   ✂️  Chat history truncated after user insight")
+
         active_llm = active_llm or _restore_llm_after_user_run(state)
         action = ask_action(active_llm, goal + strategy_context, chat_history, state)
+
+        # ================================================================
+        # FORCED-ACTION GATE
+        # If the tier ladder has queued a forced action (typically a pinned
+        # read after a write block), that action supersedes whatever the LLM
+        # proposed.  This is the *constraint, not hint* mechanism — it's the
+        # only reliable way to stop the agent from drifting back to the same
+        # wrong investigation target after a redirect.
+        # ================================================================
+        forced = state.get("forced_next_action")
+        if forced and isinstance(forced, dict) and forced.get("kind") == "ReadFileInput":
+            llm_proposal_summary = _summarize_action_for_approval(action)
+            try:
+                forced_action = ReadAction(
+                    action_type="ReadFileInput",
+                    action=ReadFileInput(
+                        file_path=forced.get("file_path") or "",
+                        error_line=int(forced.get("error_line") or 1),
+                        window_before=int(forced.get("window_before", 30)),
+                        window_after=int(forced.get("window_after", 30)),
+                    ),
+                )
+                print(f"   🔒 FORCED READ overrides LLM proposal: {forced.get('reason', '')}")
+                print(f"      LLM wanted: {llm_proposal_summary}")
+                action = forced_action
+            except Exception as _forced_err:
+                print(f"   ⚠️ Forced action synthesis failed: {_forced_err}")
+                state["forced_next_action"] = None
+        elif forced and isinstance(forced, dict) and forced.get("kind") == "RunScriptInput":
+            # After a successful direct candidate substitution (or any other
+            # action that requires re-verification), the next turn MUST be a
+            # script re-run — otherwise the LLM, still primed on the old
+            # error state, keeps proposing writes to a line we already fixed.
+            llm_proposal_summary = _summarize_action_for_approval(action)
+            try:
+                forced_action = RunAction(
+                    action_type="RunScriptInput",
+                    action=RunScriptInput(
+                        script_path=forced.get("script_path") or state.get("target_file", ""),
+                        args=forced.get("args") or state.get("run_args", []) or [],
+                    ),
+                )
+                print(f"   🔒 FORCED RUN overrides LLM proposal: {forced.get('reason', '')}")
+                print(f"      LLM wanted: {llm_proposal_summary}")
+                action = forced_action
+                # one-shot — clear so it doesn't fire again
+                state["forced_next_action"] = None
+            except Exception as _forced_err:
+                print(f"   ⚠️ Forced run synthesis failed: {_forced_err}")
+                state["forced_next_action"] = None
+
+        # ================================================================
+        # PREFLIGHT: frozen-location write rejection
+        # Writes to frozen ranges are refused *before* the preview prints.
+        # Each rejection also counts as a block event on the signature
+        # ladder, so repeated attempts reliably escalate to Tier 3 (human
+        # escalation) rather than bouncing forever between forced reads.
+        # ================================================================
+        if action.action_type == "WriteFileInput":
+            _act = action.action
+            if _is_location_frozen(state, _act.file_path, _act.start_line or 1, _act.end_line or _act.start_line or 1):
+                llm_proposal_summary = _summarize_action_for_approval(action)
+                error_line = int(state.get("error_line", 0) or 0)
+                error_file = state.get("last_error_file") or _act.file_path
+                signature = _error_signature(
+                    state,
+                    fallback_file=error_file,
+                    fallback_line=error_line or (_act.start_line or 0),
+                )
+                block_count = _increment_signature_block(state, signature) if signature else 0
+                target_tier = _should_enter_tier(signature, block_count)
+                print(f"   🪜 TIER ladder (frozen-reject): sig={signature} count={block_count} → tier={target_tier}")
+                print(f"      LLM wanted: {llm_proposal_summary}")
+
+                missing_key = ""
+                if state.get("full_error_history"):
+                    last_err = state["full_error_history"][-1] or {}
+                    if last_err.get("error_type") == "KeyError":
+                        missing_key = str(last_err.get("message") or "").strip().strip("'\"")
+
+                if target_tier >= 3:
+                    candidates = state.get("last_candidates") or _build_keyerror_candidate_table(
+                        missing_key, error_file, error_line, state=state
+                    )
+                    state["last_candidates"] = candidates
+
+                    # Interactive gate: let the user approve, insight, or stop.
+                    decision, insight = _prompt_tier_escalation(
+                        state=state,
+                        signature=signature,
+                        from_tier=_current_tier(state, signature),
+                        to_tier=3,
+                        missing_key=missing_key,
+                        candidates=candidates,
+                        context=f"frozen-reject (main-dispatch) at {_act.file_path}:{_act.start_line}",
+                    )
+                    if decision == "stop":
+                        state["current_input"] = "User stopped the run at tier-3 approval prompt."
+                        chat_history.append({"role": "user", "content": state["current_input"]})
+                        return {
+                            "status": "stopped",
+                            "reason": "user_stopped_at_tier3",
+                            "state": state,
+                            "history_len": len(chat_history),
+                            "strategy": state["strategy"],
+                            "mocked_functions": state["mocked_functions"],
+                            "config_changes": state["config_changes"],
+                            "action_history": state.get("action_history", []),
+                        }
+                    if decision == "pick" and insight:
+                        ok, msg = _apply_candidate_substitution(
+                            error_file, error_line, missing_key, insight
+                        )
+                        print(f"   🛠️  Direct candidate substitution: {msg}")
+                        state["current_input"] = (
+                            f"✅ User picked candidate '{insight}'. {msg}. Rerun the script to verify."
+                            if ok else
+                            f"⚠️ Direct substitution failed: {msg}"
+                        )
+                        chat_history.append({"role": "user", "content": state["current_input"]})
+                        continue
+                    if decision == "insight" and insight:
+                        print(f"   💡 User insight accepted — ladder reset, hint forwarded to LLM.")
+                        state["current_input"] = (
+                            f"⚠️ USER INSIGHT (ladder reset):\n{insight}\n\n"
+                            f"Apply this hint. Do NOT repeat the blocked pattern."
+                        )
+                        chat_history.append({"role": "user", "content": state["current_input"]})
+                        continue
+
+                    table = _format_candidate_table(candidates, missing_key)
+                    question = (
+                        f"Stuck on KeyError('{missing_key}') at {error_file}:{error_line}.\n"
+                        f"Automated escalation exhausted after repeated write attempts at a frozen "
+                        f"location. Need a human decision:\n"
+                        f"  (a) pick a candidate from the table,\n"
+                        f"  (b) confirm schema/config mismatch,\n"
+                        f"  (c) point at a specific file/line to inspect.\n\n{table}"
+                    )
+                    state["user_question"] = question
+                    packet_path = _write_stuck_packet(state, signature, question, candidates)
+                    print(f"   🚨 TIER 3: user escalation. Stuck-packet: {packet_path or '(not written)'}")
+                    print("\n" + "=" * 80)
+                    print(question)
+                    print("=" * 80)
+                    return {
+                        "status": "escalated",
+                        "reason": "tier3_user_escalation",
+                        "question": question,
+                        "candidates": candidates,
+                        "packet_path": packet_path,
+                        "state": state,
+                        "history_len": len(chat_history),
+                        "strategy": state["strategy"],
+                        "mocked_functions": state["mocked_functions"],
+                        "config_changes": state["config_changes"],
+                        "action_history": state.get("action_history", []),
+                    }
+
+                # Not yet Tier 3: synthesize a forced read at the pin target.
+                pin_target = state.get("artifact_read_target") or _infer_keyerror_investigation_target(
+                    _act.file_path,
+                    int(state.get("error_line", _act.start_line or 1) or 1),
+                )
+                if pin_target and pin_target.get("file"):
+                    _set_forced_read(
+                        state,
+                        file_path=pin_target["file"],
+                        line=int(pin_target.get("line") or 1),
+                        reason=pin_target.get("reason") or "frozen-location investigation target",
+                        reads=2,
+                    )
+                    try:
+                        action = ReadAction(
+                            action_type="ReadFileInput",
+                            action=ReadFileInput(
+                                file_path=pin_target["file"],
+                                error_line=int(pin_target.get("line") or 1),
+                                window_before=40,
+                                window_after=40,
+                            ),
+                        )
+                    except Exception as _synth_err:
+                        print(f"   ⚠️ Frozen-rewrite synthesis failed: {_synth_err}")
+                else:
+                    state["current_input"] = (
+                        "⛔ That write location is frozen after repeated blocked patches. "
+                        "Choose a different file/line to read or request user escalation."
+                    )
+                    chat_history.append({"role": "user", "content": state["current_input"]})
+                    continue
+
         _print_labeled_value("Next action", _summarize_action_for_approval(action), tone="action")
         action_payload = action.model_dump()
         state.setdefault("action_history", []).append(action_payload)
@@ -4895,6 +6535,22 @@ def run_llm_debug_agent(
         }) 
 
         approved, feedback = get_user_approval_for_action(action, state)
+        # Definitive run-halt: approval prompts set state["halt_requested"] when
+        # the user picks "stop".  We must exit the main loop here rather than
+        # treating it as a turn rejection.
+        if state.get("halt_requested"):
+            halt_reason = state.get("halt_reason") or "user requested halt"
+            print(f"\n   🛑 Run halted: {halt_reason}")
+            return {
+                "status": "stopped",
+                "reason": halt_reason,
+                "state": state,
+                "history_len": len(chat_history),
+                "strategy": state["strategy"],
+                "mocked_functions": state["mocked_functions"],
+                "config_changes": state["config_changes"],
+                "action_history": state.get("action_history", []),
+            }
         if not approved:
             state["current_input"] = feedback
             chat_history.append({"role": "user", "content": feedback})
@@ -5926,9 +7582,29 @@ def run_llm_debug_agent(
         # =====================================================================
         if action.action_type == "ReadFileInput":
             act = action.action
+            # ================================================================
+            # STICKY READ PIN
+            # If a pin is active, override BOTH file and line when the LLM
+            # drifts.  The pin persists across multiple reads (pin_reads_remaining)
+            # so that expanding the read window or a second block cycle does not
+            # silently lose the redirect.  The pin clears when the counter hits
+            # zero or a write successfully lands.
+            # ================================================================
             artifact_target = state.get("artifact_read_target") or {}
-            if artifact_target and os.path.normpath(act.file_path) == os.path.normpath(artifact_target.get("file", "")):
-                act.error_line = int(artifact_target.get("line", act.error_line or 1) or 1)
+            if artifact_target:
+                pinned_file = artifact_target.get("file") or ""
+                pinned_line = int(artifact_target.get("line") or 1)
+                same_file = (
+                    pinned_file
+                    and os.path.normpath(act.file_path or "") == os.path.normpath(pinned_file)
+                )
+                if same_file:
+                    act.error_line = pinned_line
+                elif pinned_file and int(state.get("pin_reads_remaining", 0)) > 0:
+                    # LLM picked a different file — override to the pinned target.
+                    print(f"   🔒 Pinned read override: redirecting from {act.file_path} to {pinned_file}:{pinned_line}")
+                    act.file_path = pinned_file
+                    act.error_line = pinned_line
             abs_path = os.path.abspath(act.file_path)
             
             # Get escalated read range if we've read this location before
@@ -5983,8 +7659,17 @@ def run_llm_debug_agent(
             file_text = file_text_res.get("content") or ""
             state["last_file_text"] = file_text
             state["last_read_file"] = act.file_path
-            if state.get("artifact_read_target") and os.path.normpath(act.file_path) == os.path.normpath((state.get("artifact_read_target") or {}).get("file", "")):
-                state["artifact_read_target"] = {}
+            # Sticky pin: decrement remaining reads, clear only when exhausted
+            # or when the LLM read the pinned target.  This prevents one
+            # successful read from releasing the pin too early.
+            if state.get("artifact_read_target"):
+                pin_file = (state.get("artifact_read_target") or {}).get("file", "")
+                if pin_file and os.path.normpath(act.file_path) == os.path.normpath(pin_file):
+                    remaining = int(state.get("pin_reads_remaining", 0)) - 1
+                    state["pin_reads_remaining"] = max(0, remaining)
+                    if remaining <= 0:
+                        state["artifact_read_target"] = {}
+                        state["forced_next_action"] = None
             state["phase"] = "READ"
             
             # Build context message
@@ -6250,34 +7935,12 @@ def run_llm_debug_agent(
                             chat_history.append({"role": "user", "content": state["current_input"]})
                             continue
                 
-                # Track repeated .get() blocks for KeyError
-                if "BAD PATTERN" in reason and ".get(" in reason:
-                    get_block_count = state.get("get_block_count", 0) + 1
-                    state["get_block_count"] = get_block_count
-                    
-                    # After 2 blocked .get() attempts, force a file read with explicit guidance
-                    if get_block_count >= 2:
-                        state["get_block_count"] = 0  # Reset counter
-                        state["force_rag"] = True
-                        
-                        # Find the error line to read around
-                        error_line = state.get("error_line", 1)
-                        error_file = state.get("last_error_file", act.file_path)
-                        
-                        print(f"   🔄 Repeated .get() blocks - forcing file read for context")
-                        state["current_input"] = (
-                            f"⚠️ You have tried .get() multiple times. THIS PATTERN IS BLOCKED.\n\n"
-                            f"You MUST use DIRECT KEY ACCESS with the CORRECT key name.\n"
-                            f"Read the file to find valid keys that exist in the codebase.\n\n"
-                            f"DO NOT use .get() - use [\"key\"] syntax instead."
-                        )
-                        chat_history.append({"role": "user", "content": state["current_input"]})
-                        
-                        # Force a read action
-                        state["phase"] = "READ"
-                        state["force_read"] = True
-                        continue
-                
+                # NOTE: the tier ladder used to live here as well, but the
+                # approval-gate in get_user_approval_for_action now owns all
+                # KeyError/key-replacement tier transitions.  Writes that
+                # reach this dispatch handler have already passed validation,
+                # so no further ladder work is needed.  Keep a plain rejection
+                # fallback in case a new validator reason is introduced.
                 state["current_input"] = f"Write blocked: {reason}. Please fix and try again."
                 chat_history.append({"role": "user", "content": f"BLOCKED: {reason}"})
                 continue
@@ -6576,7 +8239,10 @@ def run_llm_debug_agent(
             else:
                 state["current_input"] = "File written. Rerun to verify."
                 state["syntax_error_lines"] = []  # Reset on successful write
-            
+                # Successful write: drop the tier-ladder pin so a follow-up error
+                # starts from Tier 0 rather than inheriting a stale investigation target.
+                _clear_forced_action(state)
+
             chat_history.append({"role": "user", "content": f"WRITE: {write_res}, SYNTAX: {syntaxcheck}"})
             continue
 

@@ -243,7 +243,7 @@ def _rule(char: str = "=") -> str:
 def _print_codeclutch_banner() -> None:
     if _supports_ansi():
         lines = [
-            f"{DIM}           .·:*¨ {RESET}{MAGENTA}{BOLD}CodeClutch{RESET}{DIM} ¨*:·.{RESET}",
+            f"{DIM}           .·:*¨ {RESET}{MAGENTA}{BOLD}Anchor{RESET}{DIM} ¨*:·.{RESET}",
             f"{BLUE}      ╭────────────────────────────────────────────────╮{RESET}",
             f"{BLUE}      │{RESET}  {CYAN}autonomous debugging studio{RESET}  {DIM}•{RESET}  {YELLOW}live console{RESET}  {BLUE}│{RESET}",
             f"{BLUE}      ╰────────────────────────────────────────────────╯{RESET}",
@@ -253,7 +253,7 @@ def _print_codeclutch_banner() -> None:
             print(line)
         return
     print("\n" + _rule("="))
-    print("  CodeClutch")
+    print("  Anchor")
     print("  Autonomous Debugging Studio")
     print(_rule("="))
 
@@ -354,7 +354,7 @@ def print_result_summary(result: dict) -> None:
     print("Session Summary")
     print(_rule("="))
     if is_success:
-        print(_style("CodeClutch completed successfully.", GREEN, BOLD))
+        print(_style("Anchor completed successfully.", GREEN, BOLD))
         print(_style("Console clear. Target run finished without runtime errors.", DIM, CYAN))
         print(_rule("-"))
     _print_kv("Status", 'success' if is_success else status)
