@@ -1,16 +1,16 @@
-# CodeClutch
+# Anchor
 
 **Debug AI-generated Python inside your real environment, with a local LLM. No token burn, no blind edits, no code leaving your machine.**
 
-<p align="center"><img src="docs/demo.gif" alt="CodeClutch demo" width="800"/></p>
+<p align="center"><img src="docs/demo.gif" alt="Anchor demo" width="800"/></p>
 
 ---
 
-## Why CodeClutch
+## Why Anchor
 
 AI assistants write Python fast, but they don't patiently debug it. When something breaks, Copilot-style tools miss the details of your actual environment — your CUDA version, your numpy pin, your half-installed package — and burn tokens guessing at fixes from the outside.
 
-CodeClutch runs your code where it actually lives, reads the real traceback, and proposes targeted repairs. A self-hosted LLM does the heavy reasoning on your workstation, so there's no per-token bill and nothing leaves the machine. A paid API and web RAG are available as escalation paths, not the default.
+Anchor runs your code where it actually lives, reads the real traceback, and proposes targeted repairs. A self-hosted LLM does the heavy reasoning on your workstation, so there's no per-token bill and nothing leaves the machine. A paid API and web RAG are available as escalation paths, not the default.
 
 ## Design Principles
 
@@ -41,8 +41,8 @@ For larger workstations, IQuest V1 40B (4 K M quant) gives better reasoning at t
 ## Quickstart
 
 ```bash
-git clone git@github.com:shehrozashoaib/CodeClutch.git
-cd CodeClutch/v5
+git clone git@github.com:shehrozashoaib/Anchor.git
+cd Anchor/v5
 bash setup_agent_env.sh
 export DEBUG_AGENT_MODEL_PATH="/path/to/your/model.gguf"
 ./run_agent.sh
@@ -61,7 +61,7 @@ source ~/.bashrc
 
 ```
     ┌──────────┐      ┌────────────┐      ┌──────────────┐      ┌──────────┐
-    │  Your    │  →   │ CodeClutch │  →   │ Review &     │  →   │ Fix      │
+    │  Your    │  →   │ Anchor │  →   │ Review &     │  →   │ Fix      │
     │  script  │      │ runs it    │      │ approve      │      │ applied  │
     └──────────┘      └─────┬──────┘      └──────┬───────┘      └──────────┘
                             │                    │
@@ -170,7 +170,7 @@ Run user code directly (without the agent):
 
 ### CUDA builds
 
-CodeClutch builds `llama-cpp-python` against `llama.cpp` with CUDA support when it's available. Some workstations need an explicit GPU architecture override.
+Anchor builds `llama-cpp-python` against `llama.cpp` with CUDA support when it's available. Some workstations need an explicit GPU architecture override.
 
 **Symptom.** `setup_agent_env.sh` fails in the CUDA build step with an error like `nvcc does not support compute_120a` (or similar), typically because auto-detection picked a target your installed `nvcc` can't compile.
 
